@@ -1,0 +1,170 @@
+// ===========================================================================
+// SQLite-персистенс через better-sqlite3. Это drop-in замена JSON-файла:
+// сохраняем дампом таблиц при изменениях, но в SQLite, а не на диск целиком.
+//
+// Схема: одна таблица на каждый ключ `db` (users, organizations, ...).
+// Колонки: `id TEXT PRIMARY KEY, data TEXT NOT NULL`. Сама сущность лежит
+// в `data` как JSON. Это «минимальный» шаг — handlers.js по-прежнему работает
+// с in-memory объектом, мы просто переезжаем с JSON-файла на SQLite.
+//
+// Когда захочется реальной схемы (типизированные колонки, индексы по полям,
+// JOIN-ы между сущностями) — добавляйте новые таблицы и переводите конкретные
+// handlers на SQL-запросы по одной. handlers.js трогать не обязательно для
+// миграции — он использует абстрактный `db.users.filter(...)`, который можно
+// заменить на view поверх SQL.
+// ===========================================================================
+
+import Database from 'better-sqlite3'
+import { mkdirSync, existsSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { db } from '../src/mock/db.js'
+
+const HERE = dirname(fileURLToPath(import.meta.url))
+const DATA_DIR = resolve(HERE, '..', 'data')
+const DB_PATH = resolve(DATA_DIR, 'app.db')
+
+const SAVE_KEYS = [
+  'users',
+  'organizations',
+  'innRegistry',
+  'personal',
+  'infoSystems',
+  'equipment',
+  'software',
+  'securityToolsCatalog',
+  'securityTools',
+  'threatsCatalog',
+  'threatModels',
+  'documentSets',
+  'documents',
+  'audit'
+]
+
+mkdirSync(DATA_DIR, { recursive: true })
+const sqlite = new Database(DB_PATH)
+sqlite.pragma('journal_mode = WAL')
+sqlite.pragma('synchronous = NORMAL')
+
+for (const key of SAVE_KEYS) {
+  sqlite.exec(
+    `CREATE TABLE IF NOT EXISTS "${key}" (id TEXT PRIMARY KEY, data TEXT NOT NULL)`
+  )
+}
+
+// ---------- load ---------------------------------------------------------
+
+export async function loadFromDisk() {
+  let any = false
+  for (const key of SAVE_KEYS) {
+    const rows = sqlite.prepare(`SELECT data FROM "${key}"`).all()
+    if (rows.length > 0) {
+      db[key] = rows.map((r) => JSON.parse(r.data))
+      any = true
+    }
+  }
+  return any
+}
+
+// ---------- save ---------------------------------------------------------
+//
+// Алгоритм: после каждой мутации фиксируем «грязные» таблицы по чек-сумме
+// (длина + хэш последнего id). Если изменилась — переписываем таблицу
+// одной транзакцией. Это не идеально по скорости (для 100k записей —
+// сотни мс), но просто и безопасно.
+
+const checksums = new Map()
+
+function checksumOf(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return '0:'
+  const last = arr[arr.length - 1]
+  const tag = typeof last === 'object' && last ? last.id ?? last.username ?? '' : ''
+  return `${arr.length}:${tag}`
+}
+
+function writeTable(key) {
+  const arr = db[key] ?? []
+  const tx = sqlite.transaction(() => {
+    sqlite.prepare(`DELETE FROM "${key}"`).run()
+    const ins = sqlite.prepare(`INSERT INTO "${key}" (id, data) VALUES (?, ?)`)
+    for (let i = 0; i < arr.length; i++) {
+      const item = arr[i]
+      const id = typeof item === 'object' && item ? String(item.id ?? item.username ?? i) : String(i)
+      ins.run(id, JSON.stringify(item))
+    }
+  })
+  tx()
+}
+
+let pending = null
+let lastSave = 0
+const DEBOUNCE_MS = 500
+const MAX_DELAY_MS = 5000
+
+function flushNow() {
+  pending = null
+  lastSave = Date.now()
+  for (const key of SAVE_KEYS) {
+    const cs = checksumOf(db[key])
+    if (checksums.get(key) === cs) continue
+    try {
+      writeTable(key)
+      checksums.set(key, cs)
+    } catch (e) {
+      console.error(`[storage] write ${key} failed:`, e.message)
+    }
+  }
+}
+
+export function scheduleSave() {
+  const sinceLast = Date.now() - lastSave
+  if (sinceLast > MAX_DELAY_MS && !pending) {
+    flushNow()
+    return
+  }
+  if (pending) clearTimeout(pending)
+  pending = setTimeout(flushNow, DEBOUNCE_MS)
+}
+
+// ---------- graceful shutdown -------------------------------------------
+
+export function flushSync() {
+  if (pending) {
+    clearTimeout(pending)
+    pending = null
+  }
+  flushNow()
+  try { sqlite.close() } catch { void 0 }
+}
+
+// ---------- legacy JSON import (one-shot) -------------------------------
+//
+// При первом запуске после миграции с JSON: если data/app.db пустая, но есть
+// data/db.json — подгружаем оттуда и сохраняем в SQLite. Это позволяет не
+// потерять данные при апгрейде.
+
+import { readFileSync } from 'node:fs'
+const LEGACY_JSON = resolve(DATA_DIR, 'db.json')
+
+export function importLegacyJsonIfEmpty() {
+  if (!existsSync(LEGACY_JSON)) return false
+  let dbEmpty = true
+  for (const key of SAVE_KEYS) {
+    const count = sqlite.prepare(`SELECT COUNT(*) as c FROM "${key}"`).get().c
+    if (count > 0) { dbEmpty = false; break }
+  }
+  if (!dbEmpty) return false
+  try {
+    const parsed = JSON.parse(readFileSync(LEGACY_JSON, 'utf8'))
+    if (!parsed || typeof parsed !== 'object') return false
+    for (const key of SAVE_KEYS) {
+      if (Array.isArray(parsed[key])) db[key] = parsed[key]
+    }
+    flushNow()
+    console.log('[storage] imported legacy db.json into app.db')
+    return true
+  } catch (e) {
+    console.error('[storage] legacy import failed:', e.message)
+    return false
+  }
+}

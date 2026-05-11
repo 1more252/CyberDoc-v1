@@ -1,9 +1,11 @@
 import { db, nextDbId } from './db.js'
 import * as defaultSigner from './jwt-sign.js'
+import * as defaultPassword from './password.js'
 import { fnsLookup } from './fns.js'
 import { parseJwt } from '../lib/jwt.js'
 
 const FNS_CHUNK_LIMIT = 50
+const INN_BULK_LIMIT = 100
 
 let MOCK_DELAY_MS = 80
 export function setMockDelayMs(ms) {
@@ -19,6 +21,19 @@ let makeRefreshToken = defaultSigner.makeRefreshToken
 export function setTokenSigner({ makeAccessToken: ma, makeRefreshToken: mr }) {
   if (ma) makeAccessToken = ma
   if (mr) makeRefreshToken = mr
+}
+
+// === PASSWORD HASHER DI ==================================================
+// В браузере используется plain compare (./password.js). Сервер инжектит
+// scrypt-реализацию через setPasswordHasher().
+let pwHash = defaultPassword.hash
+let pwVerify = defaultPassword.verify
+let pwIsHashed = defaultPassword.isHashed
+
+export function setPasswordHasher({ hash, verify, isHashed }) {
+  if (hash) pwHash = hash
+  if (verify) pwVerify = verify
+  if (isHashed) pwIsHashed = isHashed
 }
 
 const RU_COLLATOR = new Intl.Collator('ru')
@@ -246,8 +261,17 @@ export async function handleMockRequest({ method, url, body, headers }) {
 // ---------- handlers ----------
 
 function loginHandler(body) {
-  const u = db.users.find((x) => x.username === body?.username && x.password === body?.password)
-  if (!u) return { status: 401, data: { error: 'Неверный логин или пароль' } }
+  const username = String(body?.username ?? '')
+  const password = String(body?.password ?? '')
+  const idx = db.users.findIndex((x) => x.username === username)
+  if (idx < 0) return { status: 401, data: { error: 'Неверный логин или пароль' } }
+  const u = db.users[idx]
+  if (!pwVerify(password, u.password))
+    return { status: 401, data: { error: 'Неверный логин или пароль' } }
+  // Ленивая миграция: первый успешный логин для legacy plain → пересохраняем hash.
+  if (!pwIsHashed(u.password)) {
+    db.users.splice(idx, 1, { ...u, password: pwHash(password) })
+  }
   const token = makeAccessToken({
     username: u.username,
     role: u.role,
@@ -268,7 +292,7 @@ function registerHandler(body) {
     id: nextDbId(),
     username: body.username,
     email: body.email,
-    password: body.password,
+    password: pwHash(body.password),
     role: 'user',
     verified: true,
     blocked: false,
@@ -329,8 +353,8 @@ function changePasswordHandler(body, caller) {
   const idx = db.users.findIndex((x) => x.username === caller.username)
   if (idx === -1) return { status: 404, data: { error: 'no_user' } }
   const u = db.users[idx]
-  if (u.password !== current) return { status: 400, data: { error: 'wrong_current' } }
-  db.users.splice(idx, 1, { ...u, password: next })
+  if (!pwVerify(current, u.password)) return { status: 400, data: { error: 'wrong_current' } }
+  db.users.splice(idx, 1, { ...u, password: pwHash(next) })
   return { status: 200, data: { ok: true } }
 }
 
@@ -460,6 +484,9 @@ function innBulkUpsertHandler(body, caller) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const incoming = Array.isArray(body?.items) ? body.items : []
   if (!incoming.length) return { status: 400, data: { error: 'empty' } }
+  if (incoming.length > INN_BULK_LIMIT) {
+    return { status: 413, data: { error: 'chunk_too_large', limit: INN_BULK_LIMIT } }
+  }
   const now = Date.now()
   const saved = []
   for (const item of incoming) {
@@ -905,7 +932,7 @@ function adminUserActionHandler(username, action, body, caller) {
     const password = String(body?.password ?? '')
     if (password.length < 6)
       return { status: 400, data: { error: 'password_too_short' } }
-    db.users.splice(idx, 1, { ...u, password })
+    db.users.splice(idx, 1, { ...u, password: pwHash(password) })
     for (const [tok, owner] of db.refreshTokens) {
       if (owner === username) db.refreshTokens.delete(tok)
     }

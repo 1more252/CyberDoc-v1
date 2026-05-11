@@ -75,11 +75,21 @@ export async function loadFromDisk() {
 
 const checksums = new Map()
 
+// Cheap content-aware fingerprint: rolling djb2 over JSON of каждой записи.
+// Срабатывает на splice-замену объекта (новый ref → новый JSON), что критично
+// для in-place мутаций (смена пароля, role, block-флаги, ленивая миграция
+// хеша). Стоимость O(n) на каждый save-цикл — приемлемо при debounce 500ms.
 function checksumOf(arr) {
-  if (!Array.isArray(arr) || arr.length === 0) return '0:'
-  const last = arr[arr.length - 1]
-  const tag = typeof last === 'object' && last ? last.id ?? last.username ?? '' : ''
-  return `${arr.length}:${tag}`
+  if (!Array.isArray(arr) || arr.length === 0) return '0'
+  let h = 5381 >>> 0
+  h = ((h * 33) ^ arr.length) >>> 0
+  for (let i = 0; i < arr.length; i++) {
+    const s = JSON.stringify(arr[i]) || ''
+    for (let j = 0; j < s.length; j++) {
+      h = ((h * 33) ^ s.charCodeAt(j)) >>> 0
+    }
+  }
+  return String(h)
 }
 
 function writeTable(key) {

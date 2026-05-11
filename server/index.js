@@ -20,12 +20,15 @@
 import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
+import compression from 'compression'
 import rateLimit from 'express-rate-limit'
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { handleMockRequest, setMockDelayMs, setTokenSigner } from '../src/mock/handlers.js'
+import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher } from '../src/mock/handlers.js'
 import { makeAccessToken, makeRefreshToken } from './jwt.js'
+import { hash as pwHash, verify as pwVerify, isHashed as pwIsHashed } from './password.js'
 import { loadFromDisk, scheduleSave, flushSync, importLegacyJsonIfEmpty } from './storage.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -40,6 +43,7 @@ const TRUST_PROXY = process.env.TRUST_PROXY === 'true'
 
 setMockDelayMs(0)
 setTokenSigner({ makeAccessToken, makeRefreshToken })
+setPasswordHasher({ hash: pwHash, verify: pwVerify, isHashed: pwIsHashed })
 
 importLegacyJsonIfEmpty()
 const loaded = await loadFromDisk()
@@ -67,16 +71,36 @@ app.use(
       : false
   })
 )
-app.use(cors())
+app.use(cors({ exposedHeaders: ['X-Request-Id'] }))
+// gzip всех ответов >1KB. JSON-ответы списков сжимаются в 4–10×.
+app.use(compression({ threshold: 1024 }))
 app.use(express.json({ limit: '10mb' }))
 
-// --- request logging ----------------------------------------------------
+// --- request-id + structured logging -----------------------------------
+// Каждый запрос получает UUID — он попадает в логи и в заголовок X-Request-Id
+// ответа. Клиент может прицепить тот же UUID к ошибке и найти строку в логе.
 
 app.use((req, res, next) => {
+  const reqId = req.headers['x-request-id'] || randomUUID()
+  req.reqId = reqId
+  res.setHeader('X-Request-Id', reqId)
   const t0 = Date.now()
   res.on('finish', () => {
     const ms = Date.now() - t0
-    if (ms > 100) console.log(`${req.method} ${req.originalUrl} → ${res.statusCode} ${ms}ms`)
+    // Логируем все 4xx/5xx + медленные (>100ms). 2xx быстрые — молчим.
+    if (ms > 100 || res.statusCode >= 400) {
+      const line = {
+        t: new Date().toISOString(),
+        id: reqId,
+        m: req.method,
+        u: req.originalUrl,
+        s: res.statusCode,
+        ms,
+        ip: req.ip
+      }
+      const stream = res.statusCode >= 500 ? console.error : console.log
+      stream(JSON.stringify(line))
+    }
   })
   next()
 })
@@ -134,8 +158,16 @@ app.all(/^\/api(\/.*)?$/, async (req, res) => {
     if (MUTATING.has(method) && result.status < 400) scheduleSave()
     res.status(result.status).json(result.data)
   } catch (e) {
-    console.error('[server] handler crashed:', e)
-    res.status(500).json({ error: 'internal', message: e?.message })
+    console.error(JSON.stringify({
+      t: new Date().toISOString(),
+      id: req.reqId,
+      level: 'error',
+      m: method,
+      u: url,
+      err: e?.message,
+      stack: e?.stack
+    }))
+    res.status(500).json({ error: 'internal', message: e?.message, reqId: req.reqId })
   }
 })
 

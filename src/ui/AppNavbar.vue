@@ -21,6 +21,11 @@ const dashboardLink = computed(() => {
 
 const userDropdownEl = ref(null)
 const userDropdownOpen = ref(false)
+const mobileMenuOpen = ref(false)
+
+function toggleMobileMenu() {
+  mobileMenuOpen.value = !mobileMenuOpen.value
+}
 
 function toggleUserDropdown() {
   userDropdownOpen.value = !userDropdownOpen.value
@@ -71,18 +76,17 @@ async function logout() {
       <button
         class="navbar-toggler"
         type="button"
-        data-bs-toggle="collapse"
-        data-bs-target="#cdNavbar"
+        :aria-expanded="mobileMenuOpen"
         aria-controls="cdNavbar"
-        aria-expanded="false"
         aria-label="Меню"
+        @click="toggleMobileMenu"
       >
         <span class="navbar-toggler-icon" />
       </button>
 
       <div
         id="cdNavbar"
-        class="collapse navbar-collapse"
+        :class="['collapse navbar-collapse', { show: mobileMenuOpen }]"
       >
         <ul class="navbar-nav ms-auto align-items-lg-center gap-lg-1">
           <template v-if="!auth.isAuthenticated">

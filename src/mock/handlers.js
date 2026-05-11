@@ -24,6 +24,32 @@ export function setTokenSigner({ makeAccessToken: ma, makeRefreshToken: mr }) {
 const RU_COLLATOR = new Intl.Collator('ru')
 const cmpRu = RU_COLLATOR.compare
 
+// === SORT CACHES =========================================================
+// Кешируем отсортированные «view»-массивы для тяжёлых списков. Версия бьётся
+// руками из мутирующих хендлеров — это дешевле, чем хук на каждую запись.
+let personalSortVersion = 0
+let personalSortedCache = null
+function bumpPersonal() { personalSortVersion++ }
+function getSortedPersonal() {
+  if (personalSortedCache?.v === personalSortVersion) return personalSortedCache.arr
+  const arr = [...db.personal].sort(
+    (a, b) => cmpRu(a.lastName, b.lastName) || cmpRu(a.firstName, b.firstName)
+  )
+  personalSortedCache = { v: personalSortVersion, arr }
+  return arr
+}
+
+// Lowercase-блоб для полнотекстового поиска — кешируется по ссылке на запись
+// (WeakMap), при подмене записи (splice → новый объект) старый ключ GC'нется.
+const equipmentSearchBlob = new WeakMap()
+function equipmentSearchBlobOf(e) {
+  let v = equipmentSearchBlob.get(e)
+  if (v !== undefined) return v
+  v = `${e.name}\x00${e.model ?? ''}\x00${e.serial ?? ''}\x00${e.inventoryNumber ?? ''}`.toLowerCase()
+  equipmentSearchBlob.set(e, v)
+  return v
+}
+
 export async function handleMockRequest({ method, url, body, headers }) {
   if (MOCK_DELAY_MS > 0) await delay(MOCK_DELAY_MS)
 
@@ -492,15 +518,7 @@ function equipmentListHandler(
   if (infoSystemId === 'none') items = items.filter((e) => !e.infoSystemId)
   else if (infoSystemId) items = items.filter((e) => e.infoSystemId === infoSystemId)
   if (status) items = items.filter((e) => e.status === status)
-  if (q) {
-    items = items.filter(
-      (e) =>
-        e.name.toLowerCase().includes(q) ||
-        (e.model ?? '').toLowerCase().includes(q) ||
-        (e.serial ?? '').toLowerCase().includes(q) ||
-        (e.inventoryNumber ?? '').toLowerCase().includes(q)
-    )
-  }
+  if (q) items = items.filter((e) => equipmentSearchBlobOf(e).includes(q))
 
   const total = items.length
   const start = (p - 1) * ps
@@ -920,7 +938,9 @@ function personalListHandler(
   const ps = Number(pageSize) || 20
   const q = String(search || '').trim().toLowerCase()
 
-  let items = db.personal
+  // Берём предсортированный кеш и фильтруем (filter сохраняет порядок) —
+  // O(N) вместо O(N log N) на каждый запрос.
+  let items = getSortedPersonal()
   if (caller.role === 'user') items = items.filter((x) => x.ownerUsername === caller.username)
   if (organizationId) items = items.filter((x) => x.organizationId === organizationId)
   if (q) {
@@ -933,9 +953,6 @@ function personalListHandler(
         (x.email ?? '').toLowerCase().includes(q)
     )
   }
-  items = [...items].sort(
-    (a, b) => cmpRu(a.lastName, b.lastName) || cmpRu(a.firstName, b.firstName)
-  )
   const total = items.length
   const start = (p - 1) * ps
   return { status: 200, data: { items: items.slice(start, start + ps), total } }
@@ -980,6 +997,7 @@ function personalCreateHandler(body, caller) {
     updatedAt: now
   }
   db.personal.unshift(x)
+  bumpPersonal()
   return { status: 201, data: x }
 }
 
@@ -1005,6 +1023,7 @@ function personalUpdateHandler(id, body, caller) {
     updatedAt: Date.now()
   }
   db.personal.splice(idx, 1, merged)
+  bumpPersonal()
   return { status: 200, data: merged }
 }
 
@@ -1016,6 +1035,7 @@ function personalDeleteHandler(id, caller) {
   if (caller.role === 'user' && x.ownerUsername !== caller.username)
     return { status: 403, data: { error: 'forbidden' } }
   db.personal.splice(idx, 1)
+  bumpPersonal()
   return { status: 200, data: { ok: true } }
 }
 
@@ -1074,6 +1094,7 @@ function personalBulkUpsertHandler(body, caller) {
     else db.personal.push(record)
     saved.push(record)
   }
+  if (saved.length) bumpPersonal()
   return { status: 200, data: { items: saved, errors } }
 }
 

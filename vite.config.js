@@ -33,6 +33,21 @@ export default defineConfig({
   },
   build: {
     target: 'es2022',
-    chunkSizeWarningLimit: 800
+    chunkSizeWarningLimit: 800,
+    cssCodeSplit: true,
+    rollupOptions: {
+      output: {
+        // Vendor-split: bootstrap/иконки кешируются отдельно от кода,
+        // axios/vue/pinia — отдельным «фреймворковым» чанком.
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return
+          if (id.match(/node_modules[\\/](@vue[\\/]|vue[\\/]|vue-router|pinia)/))
+            return 'framework'
+          if (id.includes('axios')) return 'http'
+          if (id.includes('docx')) return 'docx'
+          return 'vendor'
+        }
+      }
+    }
   }
 })

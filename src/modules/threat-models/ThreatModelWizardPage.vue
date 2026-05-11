@@ -376,7 +376,6 @@ onMounted(async () => {
         label="Название модели угроз"
         required
         :error="errors.name"
-        placeholder="Например: Модель угроз ИСПДн «Бухгалтерия 1С»"
         hint="По умолчанию подставляется в шапку DOCX-документа."
       />
 
@@ -470,7 +469,6 @@ onMounted(async () => {
         label="Мотивация / цели нарушителя"
         as="textarea"
         :rows="2"
-        hint="Например: финансовая выгода, конкуренты, идеологические мотивы."
       />
 
       <div class="d-flex justify-content-between align-items-end flex-wrap gap-2 mt-4 mb-3">

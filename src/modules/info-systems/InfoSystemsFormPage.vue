@@ -219,7 +219,6 @@ onMounted(async () => {
         label="Название ИС"
         required
         :error="errors.name"
-        placeholder="Например: ИС «Бухгалтерия 1С»"
       />
 
       <FormField
@@ -248,7 +247,6 @@ onMounted(async () => {
           <FormField
             v-model="form.classification"
             label="Класс защищённости"
-            placeholder="Например: УЗ-3 / К3"
             hint="Заполните вручную или после расчёта в модуле «Классификация»."
           />
         </div>
@@ -314,7 +312,6 @@ onMounted(async () => {
             v-model="form.pdnSubjectsCount"
             label="Количество субъектов ПДн"
             type="number"
-            placeholder="Например: 250"
           />
         </div>
       </div>

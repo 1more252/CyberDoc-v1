@@ -279,7 +279,6 @@ onMounted(async () => {
         label="Название"
         required
         :error="errors.name"
-        placeholder="Например: Astra Linux Special Edition 1.7"
       />
 
       <div class="row">
@@ -287,7 +286,6 @@ onMounted(async () => {
           <FormField
             v-model="form.version"
             label="Версия"
-            placeholder="Например: 1.7.5"
           />
         </div>
         <div class="col-md-6">
@@ -325,7 +323,6 @@ onMounted(async () => {
       <FormField
         v-model="form.installPath"
         label="Путь установки"
-        placeholder="Например: C:\Program Files\1cv8"
       />
 
       <FormField

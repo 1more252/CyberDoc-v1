@@ -1,5 +1,8 @@
 @use 'bootstrap/scss/bootstrap' as *;
-@use 'bootstrap-icons/font/bootstrap-icons.css';
+// bootstrap-icons — woff2-only (убирает 180 кБ .woff-фолбэка из assets).
+@use 'bootstrap-icons/font/bootstrap-icons.scss' with (
+  $bootstrap-icons-font-src: url("bootstrap-icons/font/fonts/bootstrap-icons.woff2") format("woff2")
+);
 
 :root {
   --cd-bg: #f6f7fb;

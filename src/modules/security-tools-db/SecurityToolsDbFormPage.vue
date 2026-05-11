@@ -117,7 +117,6 @@ onMounted(async () => {
         label="Наименование"
         required
         :error="errors.name"
-        placeholder="Например: Kaspersky Endpoint Security для Windows"
       />
 
       <FormField
@@ -138,14 +137,12 @@ onMounted(async () => {
           <FormField
             v-model="form.certNumber"
             label="Номер сертификата"
-            placeholder="Например: ФСТЭК № 3025"
           />
         </div>
         <div class="col-md-6">
           <FormField
             v-model="form.certClass"
             label="Класс защиты"
-            placeholder="Например: СЗИ от НСД 4 кл., НДВ 2"
           />
         </div>
       </div>

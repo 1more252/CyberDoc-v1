@@ -1,11 +1,15 @@
 // Browser-mock password adapter: plain text compare (no crypto in browser).
-// Real server инжектит scrypt-имплементацию через setPasswordHasher().
+// Реальный сервер инжектит scrypt-имплементацию через setPasswordHasher().
+//
+// Возвращаем Promise — на сервере hasher async (node:crypto scrypt в
+// thread-pool). Сигнатуры должны совпадать, чтобы хендлеры могли await'ить
+// независимо от реализации.
 
-export function hash(plain) {
+export async function hash(plain) {
   return String(plain ?? '')
 }
 
-export function verify(plain, stored) {
+export async function verify(plain, stored) {
   return String(plain ?? '') === String(stored ?? '')
 }
 

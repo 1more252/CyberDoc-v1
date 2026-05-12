@@ -260,17 +260,17 @@ export async function handleMockRequest({ method, url, body, headers }) {
 
 // ---------- handlers ----------
 
-function loginHandler(body) {
+async function loginHandler(body) {
   const username = String(body?.username ?? '')
   const password = String(body?.password ?? '')
   const idx = db.users.findIndex((x) => x.username === username)
   if (idx < 0) return { status: 401, data: { error: 'Неверный логин или пароль' } }
   const u = db.users[idx]
-  if (!pwVerify(password, u.password))
+  if (!(await pwVerify(password, u.password)))
     return { status: 401, data: { error: 'Неверный логин или пароль' } }
   // Ленивая миграция: первый успешный логин для legacy plain → пересохраняем hash.
   if (!pwIsHashed(u.password)) {
-    db.users.splice(idx, 1, { ...u, password: pwHash(password) })
+    db.users.splice(idx, 1, { ...u, password: await pwHash(password) })
   }
   const token = makeAccessToken({
     username: u.username,
@@ -283,7 +283,7 @@ function loginHandler(body) {
   return { status: 200, data: { token, refreshToken } }
 }
 
-function registerHandler(body) {
+async function registerHandler(body) {
   if (!body?.username || !body?.password || !body?.email)
     return { status: 400, data: { error: 'Заполните все поля' } }
   if (db.users.some((x) => x.username === body.username))
@@ -292,7 +292,7 @@ function registerHandler(body) {
     id: nextDbId(),
     username: body.username,
     email: body.email,
-    password: pwHash(body.password),
+    password: await pwHash(body.password),
     role: 'user',
     verified: true,
     blocked: false,
@@ -343,7 +343,7 @@ function meHandler(headers) {
   }
 }
 
-function changePasswordHandler(body, caller) {
+async function changePasswordHandler(body, caller) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const current = String(body?.currentPassword ?? '')
   const next = String(body?.newPassword ?? '')
@@ -353,8 +353,8 @@ function changePasswordHandler(body, caller) {
   const idx = db.users.findIndex((x) => x.username === caller.username)
   if (idx === -1) return { status: 404, data: { error: 'no_user' } }
   const u = db.users[idx]
-  if (!pwVerify(current, u.password)) return { status: 400, data: { error: 'wrong_current' } }
-  db.users.splice(idx, 1, { ...u, password: pwHash(next) })
+  if (!(await pwVerify(current, u.password))) return { status: 400, data: { error: 'wrong_current' } }
+  db.users.splice(idx, 1, { ...u, password: await pwHash(next) })
   return { status: 200, data: { ok: true } }
 }
 
@@ -890,7 +890,7 @@ function adminUserDeleteHandler(username, caller) {
   return { status: 200, data: { ok: true } }
 }
 
-function adminUserActionHandler(username, action, body, caller) {
+async function adminUserActionHandler(username, action, body, caller) {
   const guard = requireAdmin(caller)
   if (guard) return guard
   const idx = db.users.findIndex((x) => x.username === username)
@@ -932,7 +932,7 @@ function adminUserActionHandler(username, action, body, caller) {
     const password = String(body?.password ?? '')
     if (password.length < 6)
       return { status: 400, data: { error: 'password_too_short' } }
-    db.users.splice(idx, 1, { ...u, password: pwHash(password) })
+    db.users.splice(idx, 1, { ...u, password: await pwHash(password) })
     for (const [tok, owner] of db.refreshTokens) {
       if (owner === username) db.refreshTokens.delete(tok)
     }

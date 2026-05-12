@@ -38,7 +38,8 @@ const SAVE_KEYS = [
   'threatModels',
   'documentSets',
   'documents',
-  'audit'
+  'audit',
+  'refreshTokenMeta'
 ]
 
 mkdirSync(DATA_DIR, { recursive: true })
@@ -62,6 +63,11 @@ export async function loadFromDisk() {
       db[key] = rows.map((r) => JSON.parse(r.data))
       any = true
     }
+  }
+  // refreshTokens (Map<token, username>) — derived view от refreshTokenMeta.
+  // Перестраиваем после load, чтобы handlers.js видел сохранённые сессии.
+  if (Array.isArray(db.refreshTokenMeta)) {
+    db.refreshTokens = new Map(db.refreshTokenMeta.map((s) => [s.token, s.username]))
   }
   return any
 }

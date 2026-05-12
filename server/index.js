@@ -79,6 +79,11 @@ const READ_ONLY = process.env.READ_ONLY === 'true'
 // Папка для бэкапов; создаётся лениво при первом запросе бэкапа.
 const BACKUP_DIR = resolve(HERE, '..', 'data', 'backups')
 
+// Порог для warning по размеру -wal. Если -wal распух (нет checkpoint'ов
+// долго) — обычно симптом «висящих» readers или забытого админа. 100MB
+// для нашей нагрузки = аномалия, повод дёрнуть /api/admin/wal-checkpoint.
+const WAL_ALERT_MB = Number(process.env.WAL_ALERT_MB) || 100
+
 // --- bootstrap -----------------------------------------------------------
 
 setMockDelayMs(0)
@@ -230,11 +235,19 @@ app.get('/health', (_req, res) => {
   const mem = process.memoryUsage()
   // Суммируем app.db + -wal + -shm: в WAL-режиме реальные данные лежат
   // в -wal до checkpoint'а, без суммы размер кажется аномально малым.
-  let dbSize = 0
+  // -wal считаем отдельно, чтобы вынести в watch-метрику (раздутый -wal —
+  // частый источник «откуда место кончилось»).
   const dbPath = getDbPath()
+  let dbSize = 0
+  let walSize = 0
   for (const suffix of ['', '-wal', '-shm']) {
-    try { dbSize += statSync(dbPath + suffix).size } catch { /* нет файла */ }
+    try {
+      const sz = statSync(dbPath + suffix).size
+      dbSize += sz
+      if (suffix === '-wal') walSize = sz
+    } catch { /* нет файла */ }
   }
+  const walSizeMB = Math.round((walSize / 1024 / 1024) * 100) / 100
 
   res.json({
     ok: true,
@@ -245,7 +258,9 @@ app.get('/health', (_req, res) => {
     db: {
       users: countUsers(),
       pendingWrites: hasPendingWrites(),
-      sizeMB: Math.round((dbSize / 1024 / 1024) * 100) / 100
+      sizeMB: Math.round((dbSize / 1024 / 1024) * 100) / 100,
+      walSizeMB,
+      walAlert: walSizeMB > WAL_ALERT_MB
     },
     mem: {
       rssMB: Math.round((mem.rss / 1024 / 1024) * 100) / 100,
@@ -276,6 +291,41 @@ app.get('/metrics', (req, res) => {
   const meanLatency = metrics.totalRequests > 0
     ? Math.round((metrics.totalLatencyMs / metrics.totalRequests) * 100) / 100
     : 0
+
+  // ?format=prom — text/plain в Prometheus exposition format. Не пытаемся
+  // быть полным prom-client (без histogram, без registry merge), но
+  // покрываем основное: counters + gauges. node_exporter рядом всё равно
+  // даёт CPU/IO/network.
+  if (req.query.format === 'prom') {
+    const lines = []
+    const fmtLabels = (labels) =>
+      labels ? `{${Object.entries(labels).map(([k, v]) => `${k}="${v}"`).join(',')}}` : ''
+    const single = (name, help, type, value) => {
+      lines.push(`# HELP ${name} ${help}`)
+      lines.push(`# TYPE ${name} ${type}`)
+      lines.push(`${name} ${value}`)
+    }
+    const grouped = (name, help, type, entries, labelKey) => {
+      lines.push(`# HELP ${name} ${help}`)
+      lines.push(`# TYPE ${name} ${type}`)
+      for (const [k, v] of Object.entries(entries)) {
+        lines.push(`${name}${fmtLabels({ [labelKey]: k })} ${v}`)
+      }
+    }
+    single('apn_uptime_seconds', 'Server uptime in seconds', 'counter', Math.floor(uptimeMs / 1000))
+    single('apn_inflight_current', 'Current inflight requests', 'gauge', inflight)
+    single('apn_inflight_peak', 'Peak inflight requests since start', 'gauge', peakInflight)
+    single('apn_inflight_users', 'Distinct authenticated users with inflight requests', 'gauge', inflightByUser.size)
+    single('apn_read_only', 'Whether READ_ONLY mode is on (1/0)', 'gauge', READ_ONLY ? 1 : 0)
+    single('apn_mean_latency_ms', 'Mean response latency (ms) since start', 'gauge', meanLatency)
+    single('apn_slow_requests_total', 'Requests slower than 500ms', 'counter', metrics.slowRequests)
+    single('apn_error_responses_total', 'Responses with status >=500', 'counter', metrics.errorResponses)
+    grouped('apn_requests_total', 'HTTP requests by status class', 'counter', metrics.byStatusClass, 'status')
+    grouped('apn_requests_by_method_total', 'HTTP requests by method', 'counter', metrics.byMethod, 'method')
+    res.type('text/plain; version=0.0.4; charset=utf-8').send(lines.join('\n') + '\n')
+    return
+  }
+
   res.json({
     uptimeSec: Math.floor(uptimeMs / 1000),
     totalRequests: metrics.totalRequests,
@@ -308,8 +358,22 @@ const loginLimiter = rateLimit({
   message: { error: 'login_rate_limited', message: 'Слишком много попыток входа. Попробуйте позже.' }
 })
 
+// Жёсткий лимит для admin-эндпоинтов (wal-checkpoint, backup, sessions).
+// Они дорогие (VACUUM INTO блокирует страницы, checkpoint пишет на диск)
+// и при автоматизации легко улететь в шторм. 30/мин — больше чем нужно
+// человеку, но мешает циклу. По IP, не по юзеру: если кто-то украл админ-
+// токен, лимит всё равно сработает.
+const adminLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'admin_rate_limited', message: 'Слишком много admin-запросов. Притормозите.' }
+})
+
 app.use('/api/auth/login', loginLimiter)
 app.use('/api/auth/register', loginLimiter)
+app.use('/api/admin', adminLimiter)
 app.use('/api', apiLimiter)
 
 // --- per-user concurrent quota + shutdown guard ------------------------
@@ -399,7 +463,10 @@ function isEtagRoute(url) {
 app.all(/^\/api(\/.*)?$/, async (req, res) => {
   const method = req.method.toUpperCase()
   const url = req.originalUrl.replace(/^\/api/, '') || '/'
-  const headers = { authorization: req.headers.authorization }
+  const headers = {
+    authorization: req.headers.authorization,
+    'user-agent': req.headers['user-agent']
+  }
   try {
     const result = await handleMockRequest({
       method,

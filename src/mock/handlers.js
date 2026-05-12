@@ -71,12 +71,19 @@ export async function handleMockRequest({ method, url, body, headers }) {
   const path = stripQuery(url)
 
   // === AUTH =============================================================
-  if (method === 'POST' && path === '/auth/login') return loginHandler(body)
+  if (method === 'POST' && path === '/auth/login') return loginHandler(body, headers)
   if (method === 'POST' && path === '/auth/register') return registerHandler(body)
-  if (method === 'POST' && path === '/auth/refresh') return refreshHandler(body)
+  if (method === 'POST' && path === '/auth/refresh') return refreshHandler(body, headers)
   if (method === 'POST' && path === '/auth/logout') return logoutHandler(body)
   if (method === 'GET' && path === '/auth/me') return meHandler(headers)
   if (method === 'POST' && path === '/auth/password') return changePasswordHandler(body, getCaller(headers))
+
+  // === AUTH: sessions (refresh-token store) ============================
+  const sessionIdMatch = path.match(/^\/auth\/sessions\/([^/]+)$/)
+  if (method === 'GET' && path === '/auth/sessions')
+    return sessionsListHandler(getCaller(headers))
+  if (method === 'DELETE' && sessionIdMatch)
+    return sessionsDeleteHandler(sessionIdMatch[1], getCaller(headers))
 
   // === DICTIONARIES (read-only справочники КиберДок) ====================
   const dictMatch = path.match(/^\/dictionaries\/([a-zA-Z_]+)$/)
@@ -260,7 +267,7 @@ export async function handleMockRequest({ method, url, body, headers }) {
 
 // ---------- handlers ----------
 
-async function loginHandler(body) {
+async function loginHandler(body, headers) {
   const username = String(body?.username ?? '')
   const password = String(body?.password ?? '')
   const idx = db.users.findIndex((x) => x.username === username)
@@ -279,7 +286,7 @@ async function loginHandler(body) {
     blocked: u.blocked
   })
   const refreshToken = makeRefreshToken(u.username)
-  db.refreshTokens.set(refreshToken, u.username)
+  registerSession(refreshToken, u.username, headers)
   return { status: 200, data: { token, refreshToken } }
 }
 
@@ -301,7 +308,7 @@ async function registerHandler(body) {
   return { status: 201, data: { ok: true } }
 }
 
-function refreshHandler(body) {
+function refreshHandler(body, headers) {
   const username = db.refreshTokens.get(body?.refreshToken)
   if (!username) return { status: 401, data: { error: 'invalid_refresh' } }
   const u = db.users.find((x) => x.username === username)
@@ -313,13 +320,77 @@ function refreshHandler(body) {
     blocked: u.blocked
   })
   const newRefresh = makeRefreshToken(u.username)
-  db.refreshTokens.delete(body.refreshToken)
-  db.refreshTokens.set(newRefresh, u.username)
+  // Rotation: убираем старый, регистрируем новый. Если кто-то перехватил
+  // старый refresh — после rotation он невалиден.
+  revokeSession(body.refreshToken)
+  registerSession(newRefresh, u.username, headers)
   return { status: 200, data: { token, refreshToken: newRefresh } }
 }
 
 function logoutHandler(body) {
-  if (body?.refreshToken) db.refreshTokens.delete(body.refreshToken)
+  if (body?.refreshToken) revokeSession(body.refreshToken)
+  return { status: 200, data: { ok: true } }
+}
+
+// ---------- session store helpers ----------
+// refreshTokens (Map) + refreshTokenMeta (array) обновляются вместе.
+// Источник истины — массив (он персистится в SQLite); Map — это derived view
+// для O(1) lookup. Обе структуры должны быть в синхроне.
+
+function registerSession(token, username, headers) {
+  const now = Date.now()
+  const ua = String(headers?.['user-agent'] ?? '').slice(0, 200)
+  db.refreshTokens.set(token, username)
+  db.refreshTokenMeta.push({
+    id: `sess-${now}-${Math.random().toString(36).slice(2, 8)}`,
+    token,
+    username,
+    createdAt: now,
+    lastUsed: now,
+    userAgent: ua
+  })
+}
+
+function revokeSession(token) {
+  if (!token) return false
+  const had = db.refreshTokens.delete(token)
+  const idx = db.refreshTokenMeta.findIndex((s) => s.token === token)
+  if (idx >= 0) db.refreshTokenMeta.splice(idx, 1)
+  return had
+}
+
+function revokeAllSessionsOf(username) {
+  for (const [tok, owner] of db.refreshTokens) {
+    if (owner === username) db.refreshTokens.delete(tok)
+  }
+  db.refreshTokenMeta = db.refreshTokenMeta.filter((s) => s.username !== username)
+}
+
+function sessionsListHandler(caller) {
+  if (!caller) return { status: 401, data: { error: 'no_token' } }
+  const items = db.refreshTokenMeta
+    .filter((s) => s.username === caller.username)
+    .map((s) => ({
+      id: s.id,
+      createdAt: s.createdAt,
+      lastUsed: s.lastUsed,
+      userAgent: s.userAgent
+      // Сам token не возвращаем — это secret. ID хватает для revoke.
+    }))
+    .sort((a, b) => b.lastUsed - a.lastUsed)
+  return { status: 200, data: { items, total: items.length } }
+}
+
+function sessionsDeleteHandler(sessionId, caller) {
+  if (!caller) return { status: 401, data: { error: 'no_token' } }
+  const idx = db.refreshTokenMeta.findIndex((s) => s.id === sessionId)
+  if (idx < 0) return { status: 404, data: { error: 'not_found' } }
+  const sess = db.refreshTokenMeta[idx]
+  // user → только свои; admin → любые.
+  if (caller.role !== 'admin' && sess.username !== caller.username) {
+    return { status: 403, data: { error: 'forbidden' } }
+  }
+  revokeSession(sess.token)
   return { status: 200, data: { ok: true } }
 }
 
@@ -409,6 +480,7 @@ function orgCreateHandler(body, caller) {
     updatedAt: now
   }
   db.organizations.unshift(o)
+  logAudit(caller.username, 'org.create', o.id, JSON.stringify({ after: { name: o.name, inn: o.inn, kind: o.kind } }))
   return { status: 201, data: o }
 }
 
@@ -433,6 +505,7 @@ function orgUpdateHandler(id, body, caller) {
     updatedAt: Date.now()
   }
   db.organizations.splice(idx, 1, merged)
+  logAuditDiff(caller.username, 'org.update', id, o, merged, ORG_DIFF_FIELDS)
   return { status: 200, data: merged }
 }
 
@@ -444,6 +517,10 @@ function orgDeleteHandler(id, caller) {
   if (caller.role === 'user' && o.ownerUsername !== caller.username)
     return { status: 403, data: { error: 'forbidden' } }
   db.organizations.splice(idx, 1)
+  // Снапшот удалённой организации в before — позволяет реконструировать факт.
+  const snap = {}
+  for (const f of ORG_DIFF_FIELDS) snap[f] = o[f]
+  logAudit(caller.username, 'org.delete', id, JSON.stringify({ before: snap }))
   return { status: 200, data: { ok: true } }
 }
 
@@ -847,6 +924,37 @@ function logAudit(actor, action, target, details = '') {
   if (db.audit.length > 5000) db.audit.length = 5000
 }
 
+// Сравнивает before/after по списку полей и возвращает только изменения.
+// Пустой `before` — значит нечего логировать (вызывающий пусть решает).
+function diffFields(before, after, fields) {
+  const b = {}
+  const a = {}
+  for (const f of fields) {
+    const bv = before?.[f]
+    const av = after?.[f]
+    if (JSON.stringify(bv) !== JSON.stringify(av)) {
+      b[f] = bv
+      a[f] = av
+    }
+  }
+  return { before: b, after: a }
+}
+
+// audit-запись с JSON-diff'ом в details. Если diff пустой (никакие fields не
+// поменялись) — не пишем, чтобы не засорять лог no-op PUT'ами.
+function logAuditDiff(actor, action, target, before, after, fields) {
+  const diff = diffFields(before, after, fields)
+  if (Object.keys(diff.before).length === 0) return
+  logAudit(actor, action, target, JSON.stringify(diff))
+}
+
+// Поля организации, которые попадают в diff. password/createdAt/updatedAt
+// логировать не имеет смысла.
+const ORG_DIFF_FIELDS = ['kind', 'name', 'inn', 'ogrn', 'kpp', 'address', 'phone', 'email', 'notes']
+// Пользовательские поля для diff'а. Сам password не логируем — только сам
+// факт смены через `user.password` action.
+const USER_DIFF_FIELDS = ['role', 'verified', 'blocked', 'email']
+
 function adminUserListHandler({ page = 1, pageSize = 20, search = '', role = '' }, caller) {
   const guard = requireAdmin(caller)
   if (guard) return guard
@@ -883,11 +991,12 @@ function adminUserDeleteHandler(username, caller) {
   if (hasOrgs || hasEq || hasDocs)
     return { status: 409, data: { error: 'has_dependencies' } }
 
+  const deleted = db.users[idx]
   db.users.splice(idx, 1)
-  for (const [tok, owner] of db.refreshTokens) {
-    if (owner === username) db.refreshTokens.delete(tok)
-  }
-  logAudit(caller.username, 'user.delete', username)
+  revokeAllSessionsOf(username)
+  // Снапшот без password, чтобы хеш не утёк в общий лог.
+  const snap = { username: deleted.username, email: deleted.email, role: deleted.role, verified: deleted.verified, blocked: deleted.blocked }
+  logAudit(caller.username, 'user.delete', username, JSON.stringify({ before: snap }))
   return { status: 200, data: { ok: true } }
 }
 
@@ -901,21 +1010,19 @@ async function adminUserActionHandler(username, action, body, caller) {
 
   if (action === 'verify') {
     const verified = body?.verified !== undefined ? !!body.verified : true
-    db.users.splice(idx, 1, { ...u, verified })
-    logAudit(caller.username, 'user.verify', username, verified ? 'подтверждён' : 'снято подтверждение')
+    const updated = { ...u, verified }
+    db.users.splice(idx, 1, updated)
+    logAuditDiff(caller.username, 'user.verify', username, u, updated, USER_DIFF_FIELDS)
     return { status: 200, data: publicUser(db.users[idx]) }
   }
 
   if (action === 'block') {
     if (isSelf) return { status: 409, data: { error: 'self_block_forbidden' } }
     const blocked = body?.blocked !== undefined ? !!body.blocked : true
-    db.users.splice(idx, 1, { ...u, blocked })
-    if (blocked) {
-      for (const [tok, owner] of db.refreshTokens) {
-        if (owner === username) db.refreshTokens.delete(tok)
-      }
-    }
-    logAudit(caller.username, 'user.block', username, blocked ? 'заблокирован' : 'разблокирован')
+    const updated = { ...u, blocked }
+    db.users.splice(idx, 1, updated)
+    if (blocked) revokeAllSessionsOf(username)
+    logAuditDiff(caller.username, 'user.block', username, u, updated, USER_DIFF_FIELDS)
     return { status: 200, data: publicUser(db.users[idx]) }
   }
 
@@ -924,8 +1031,9 @@ async function adminUserActionHandler(username, action, body, caller) {
     const role = body?.role
     if (!ADMIN_ROLES.includes(role))
       return { status: 400, data: { error: 'invalid_role', allowed: ADMIN_ROLES } }
-    db.users.splice(idx, 1, { ...u, role })
-    logAudit(caller.username, 'user.role', username, `→ ${role}`)
+    const updated = { ...u, role }
+    db.users.splice(idx, 1, updated)
+    logAuditDiff(caller.username, 'user.role', username, u, updated, USER_DIFF_FIELDS)
     return { status: 200, data: publicUser(db.users[idx]) }
   }
 
@@ -934,9 +1042,7 @@ async function adminUserActionHandler(username, action, body, caller) {
     if (password.length < 6)
       return { status: 400, data: { error: 'password_too_short' } }
     db.users.splice(idx, 1, { ...u, password: await pwHash(password) })
-    for (const [tok, owner] of db.refreshTokens) {
-      if (owner === username) db.refreshTokens.delete(tok)
-    }
+    revokeAllSessionsOf(username)
     logAudit(caller.username, 'user.password', username, 'пароль изменён')
     return { status: 200, data: publicUser(db.users[idx]) }
   }

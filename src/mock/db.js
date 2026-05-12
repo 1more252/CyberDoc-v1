@@ -9,6 +9,11 @@ export const db = ({
     { id: 6, username: 'expert2', email: 'expert2@example.com', password: 'expert2123', role: 'expert', verified: true, blocked: false, createdAt: Date.now() - 86400000 * 7 }
   ],
   refreshTokens: new Map(),
+  // Параллельный массив для персистентности: {id, token, username, createdAt,
+  // lastUsed, userAgent}. Map выше остаётся для O(1) lookup; этот массив
+  // даёт SQLite-сохранение и список сессий юзера. Источник истины — массив:
+  // при загрузке с диска Map восстанавливается из него.
+  refreshTokenMeta: [],
   organizations: [],
   innRegistry: [],
 

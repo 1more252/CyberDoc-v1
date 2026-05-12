@@ -3,20 +3,26 @@
 //
 // Слои:
 //   • helmet           — security-заголовки
-//   • CORS             — для дева (фронт на 5173, бэк на 3001)
-//   • rate-limit       — защита /api/* от перебора
-//   • express.json     — парсинг тел запросов
-//   • request logging  — медленные ответы (>100ms) + inflight-счётчик
-//   • per-user quota   — не более N одновременных запросов на одного юзера
+//   • CORS             — '*' в деве, allowlist через ALLOWED_ORIGINS в проде
+//   • compression      — gzip ответов >1KB
+//   • rate-limit       — общий (300/мин) + login/register (20/15мин)
+//   • express.json     — парсинг тел (limit 10mb)
+//   • inflight + log   — req-id, метрики, медленные ответы (>100ms)
+//   • READ_ONLY guard  — мутации → 503 при READ_ONLY=true
+//   • per-user quota   — ≤ PER_USER_INFLIGHT_LIMIT (20) на юзера → 429
 //   • ETag             — для read-only справочников (304 Not Modified)
-//   • /health          — расширенный пинг: БД, RAM, inflight, db-size
+//   • /health          — БД, RAM, inflight, peak, db-size, readOnly
+//   • /metrics         — admin: totalRequests, byStatusClass, mean latency
+//   • /api/admin/*     — wal-checkpoint, backup (admin-only)
 //   • /api/*           — диспетчер на handleMockRequest
 //   • static + SPA     — если SERVE_STATIC=true, отдаём dist/
 //
 // Запуск:
-//   npm run server           — только бэк, dev (порт 3001)
-//   SERVE_STATIC=true npm run server  — отдаёт ещё и dist/ (prod)
-//   JWT_SECRET=... npm run server     — реальный секрет для прода
+//   npm run server                         — dev (порт 3001)
+//   SERVE_STATIC=true npm run server       — отдаёт ещё и dist/ (prod)
+//   JWT_SECRET=... npm run server          — реальный секрет для прода
+//   ALLOWED_ORIGINS=https://a,https://b … — CORS allowlist
+//   READ_ONLY=true npm run server          — режим обслуживания
 // ===========================================================================
 
 import express from 'express'
@@ -25,7 +31,7 @@ import helmet from 'helmet'
 import compression from 'compression'
 import rateLimit from 'express-rate-limit'
 import { randomUUID, createHash } from 'node:crypto'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, statSync, mkdirSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher } from '../src/mock/handlers.js'
@@ -35,10 +41,13 @@ import {
   loadFromDisk,
   scheduleSave,
   flushSync,
+  flushPending,
   importLegacyJsonIfEmpty,
   hasPendingWrites,
   getDbPath,
-  countUsers
+  countUsers,
+  walCheckpoint,
+  backupTo
 } from './storage.js'
 import { parseJwt } from '../src/lib/jwt.js'
 
@@ -57,6 +66,18 @@ const PER_USER_INFLIGHT_LIMIT = Number(process.env.PER_USER_INFLIGHT_LIMIT) || 2
 
 // Сколько ждать дренажа inflight перед shutdown'ом.
 const SHUTDOWN_DRAIN_MS = Number(process.env.SHUTDOWN_DRAIN_MS) || 5000
+
+// CORS-allowlist. По умолчанию '*' (дев); в проде задаём список доменов
+// через запятую: ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
+  .split(',').map((s) => s.trim()).filter(Boolean)
+
+// Read-only режим: все мутации возвращают 503. Полезно при миграциях/backup'ах,
+// чтобы клиенты получали явный сигнал и могли отступить.
+const READ_ONLY = process.env.READ_ONLY === 'true'
+
+// Папка для бэкапов; создаётся лениво при первом запросе бэкапа.
+const BACKUP_DIR = resolve(HERE, '..', 'data', 'backups')
 
 // --- bootstrap -----------------------------------------------------------
 
@@ -90,7 +111,23 @@ app.use(
       : false
   })
 )
-app.use(cors({ exposedHeaders: ['X-Request-Id', 'ETag'] }))
+// CORS: либо «*» (дев), либо строгий allowlist (прод).
+const corsOptions = {
+  exposedHeaders: ['X-Request-Id', 'ETag'],
+  ...(ALLOWED_ORIGINS.includes('*')
+    ? {}
+    : {
+        origin: (origin, cb) => {
+          // Запросы без Origin (curl, same-origin server-side) пропускаем —
+          // браузерные кросс-доменные обязаны слать Origin.
+          if (!origin) return cb(null, true)
+          cb(null, ALLOWED_ORIGINS.includes(origin))
+        }
+      })
+}
+app.use(cors(corsOptions))
+console.log(`[server] CORS: ${ALLOWED_ORIGINS.includes('*') ? 'open (*)' : 'allowlist=' + ALLOWED_ORIGINS.join(',')}`)
+if (READ_ONLY) console.warn('[server] READ_ONLY mode: mutations will return 503')
 // gzip всех ответов >1KB. JSON-ответы списков сжимаются в 4–10×.
 app.use(compression({ threshold: 1024 }))
 app.use(express.json({ limit: '10mb' }))
@@ -101,7 +138,22 @@ app.use(express.json({ limit: '10mb' }))
 // обрыве соединения счётчик утечёт.
 
 let inflight = 0
+let peakInflight = 0
 const inflightByUser = new Map()
+
+// --- метрики ------------------------------------------------------------
+// Лёгкие in-memory счётчики; не Prometheus-grade, но даёт картину тренда
+// без внешних зависимостей. Сбрасываются при рестарте — для большего нужен
+// внешний exporter.
+const metrics = {
+  startedAt: Date.now(),
+  totalRequests: 0,
+  byStatusClass: { '2xx': 0, '3xx': 0, '4xx': 0, '5xx': 0 },
+  byMethod: {},
+  slowRequests: 0,      // >500ms
+  errorResponses: 0,    // 5xx
+  totalLatencyMs: 0     // сумма для подсчёта среднего
+}
 
 function bumpUser(username, delta) {
   if (!username) return
@@ -127,6 +179,7 @@ app.use((req, res, next) => {
   const t0 = Date.now()
 
   inflight++
+  if (inflight > peakInflight) peakInflight = inflight
   const user = callerName(req)
   req._user = user
   bumpUser(user, +1)
@@ -141,6 +194,15 @@ app.use((req, res, next) => {
   res.on('close', release)
   res.on('finish', () => {
     const ms = Date.now() - t0
+    // Метрики: считаем всё, но без percentile-tracking (лишний overhead).
+    metrics.totalRequests++
+    metrics.totalLatencyMs += ms
+    if (ms > 500) metrics.slowRequests++
+    const cls = `${Math.floor(res.statusCode / 100)}xx`
+    if (metrics.byStatusClass[cls] !== undefined) metrics.byStatusClass[cls]++
+    if (res.statusCode >= 500) metrics.errorResponses++
+    metrics.byMethod[req.method] = (metrics.byMethod[req.method] || 0) + 1
+
     // Логируем все 4xx/5xx + медленные (>100ms). 2xx быстрые — молчим.
     if (ms > 100 || res.statusCode >= 400) {
       const line = {
@@ -192,9 +254,39 @@ app.get('/health', (_req, res) => {
     },
     inflight: {
       total: inflight,
+      peak: peakInflight,
       uniqueUsers: inflightByUser.size
     },
+    readOnly: READ_ONLY,
     shuttingDown
+  })
+})
+
+// --- /metrics (admin-only) ---------------------------------------------
+// JSON-метрики: для интеграции с дашбордом. Считаем accept-roles из bearer-токена,
+// чтобы не тянуть в handlers ради одного эндпоинта.
+
+app.get('/metrics', (req, res) => {
+  const auth = req.headers.authorization || ''
+  const payload = auth.startsWith('Bearer ') ? parseJwt(auth.slice(7)) : null
+  if (payload?.role !== 'admin') {
+    return res.status(403).json({ error: 'admin_only' })
+  }
+  const uptimeMs = Date.now() - metrics.startedAt
+  const meanLatency = metrics.totalRequests > 0
+    ? Math.round((metrics.totalLatencyMs / metrics.totalRequests) * 100) / 100
+    : 0
+  res.json({
+    uptimeSec: Math.floor(uptimeMs / 1000),
+    totalRequests: metrics.totalRequests,
+    rps: metrics.totalRequests / (uptimeMs / 1000),
+    meanLatencyMs: meanLatency,
+    slowRequests: metrics.slowRequests,
+    errorResponses: metrics.errorResponses,
+    byStatusClass: metrics.byStatusClass,
+    byMethod: metrics.byMethod,
+    inflight: { current: inflight, peak: peakInflight },
+    readOnly: READ_ONLY
   })
 })
 
@@ -224,9 +316,22 @@ app.use('/api', apiLimiter)
 // Чек после rate-limit (не тратим квоту на отбитые запросы) и до dispatcher'а
 // (не запускаем тяжёлую работу). Анон-запросы пропускаем.
 
+const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
 app.use('/api', (req, res, next) => {
   if (shuttingDown) {
     return res.status(503).json({ error: 'shutting_down', message: 'Сервер завершает работу.' })
+  }
+  // READ_ONLY: мутации → 503. Исключения: login/refresh/logout (нужны для
+  // авторизации админа в режиме обслуживания) и /admin/* (это и есть инструменты
+  // обслуживания). change-password остаётся заблокированным.
+  if (READ_ONLY && MUTATING.has(req.method)) {
+    const path = req.path
+    const exempt = path === '/auth/login' || path === '/auth/refresh' ||
+                   path === '/auth/logout' || path.startsWith('/admin/')
+    if (!exempt) {
+      return res.status(503).json({ error: 'read_only', message: 'Сервер в режиме read-only.' })
+    }
   }
   const user = req._user
   if (!user) return next()
@@ -239,6 +344,40 @@ app.use('/api', (req, res, next) => {
     })
   }
   next()
+})
+
+// --- admin maintenance (вне handlers.js) -------------------------------
+// Эти эндпоинты живут на уровне сервера, не диспетчера: им нужен доступ к
+// sqlite-инстансу и файловой системе. Авторизация — admin-роль из JWT.
+
+function requireAdmin(req, res) {
+  const auth = req.headers.authorization || ''
+  const payload = auth.startsWith('Bearer ') ? parseJwt(auth.slice(7)) : null
+  if (payload?.role !== 'admin') {
+    res.status(403).json({ error: 'admin_only' })
+    return null
+  }
+  return payload
+}
+
+app.post('/api/admin/wal-checkpoint', (req, res) => {
+  if (!requireAdmin(req, res)) return
+  // Перед checkpoint'ом сбрасываем pending-saves, иначе можем пропустить
+  // последние мутации.
+  flushPending()
+  const result = walCheckpoint()
+  res.json({ ok: true, ...result })
+})
+
+app.post('/api/admin/backup', (req, res) => {
+  if (!requireAdmin(req, res)) return
+  try { mkdirSync(BACKUP_DIR, { recursive: true }) } catch { /* exists */ }
+  flushPending()
+  const ts = new Date().toISOString().replace(/[:.]/g, '-')
+  const dest = resolve(BACKUP_DIR, `app-${ts}.db`)
+  const info = backupTo(dest)
+  if (info.error) return res.status(500).json({ ok: false, ...info })
+  res.json({ ok: true, ...info })
 })
 
 // --- ETag для read-only справочников -----------------------------------
@@ -256,8 +395,6 @@ function isEtagRoute(url) {
 }
 
 // --- main API dispatcher -----------------------------------------------
-
-const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
 app.all(/^\/api(\/.*)?$/, async (req, res) => {
   const method = req.method.toUpperCase()

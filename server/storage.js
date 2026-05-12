@@ -15,7 +15,7 @@
 // ===========================================================================
 
 import Database from 'better-sqlite3'
-import { mkdirSync, existsSync } from 'node:fs'
+import { mkdirSync, existsSync, statSync, unlinkSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { db } from '../src/mock/db.js'
@@ -136,14 +136,23 @@ export function scheduleSave() {
   pending = setTimeout(flushNow, DEBOUNCE_MS)
 }
 
-// ---------- graceful shutdown -------------------------------------------
+// ---------- explicit flush (без закрытия БД) ----------------------------
+// Для admin-операций (checkpoint, backup) нужно дописать pending мутации
+// в файл, но БД оставить открытой. flushSync дополнительно закрывает БД —
+// он только для shutdown'а.
 
-export function flushSync() {
+export function flushPending() {
   if (pending) {
     clearTimeout(pending)
     pending = null
   }
   flushNow()
+}
+
+// ---------- graceful shutdown -------------------------------------------
+
+export function flushSync() {
+  flushPending()
   try { sqlite.close() } catch { void 0 }
 }
 
@@ -157,13 +166,30 @@ export function getDbPath() {
   return DB_PATH
 }
 
-// Дешёвый COUNT(*) по таблице users — для sanity-чека что БД жива.
-// Возвращает -1 если запрос упал (БД закрыта/повреждена). Не кидает.
+// Дешёвый COUNT(*) по users — sanity-чек что БД жива. -1 при ошибке.
 export function countUsers() {
   try {
     return sqlite.prepare('SELECT COUNT(*) AS c FROM "users"').get().c
   } catch {
     return -1
+  }
+}
+
+// WAL-checkpoint(TRUNCATE): переносит -wal в .db и усекает -wal до 0.
+// Возвращает {busy, log, checkpointed}.
+export function walCheckpoint() {
+  return sqlite.pragma('wal_checkpoint(TRUNCATE)')
+}
+
+// Атомарный бэкап через VACUUM INTO — консистентный снапшот без блокировок.
+export function backupTo(destPath) {
+  try { unlinkSync(destPath) } catch { void 0 }
+  sqlite.exec(`VACUUM INTO '${destPath.replace(/'/g, "''")}'`)
+  try {
+    const st = statSync(destPath)
+    return { path: destPath, sizeBytes: st.size, mtime: st.mtime.toISOString() }
+  } catch (e) {
+    return { path: destPath, error: e.message }
   }
 }
 
@@ -173,7 +199,6 @@ export function countUsers() {
 // data/db.json — подгружаем оттуда и сохраняем в SQLite. Это позволяет не
 // потерять данные при апгрейде.
 
-import { readFileSync } from 'node:fs'
 const LEGACY_JSON = resolve(DATA_DIR, 'db.json')
 
 export function importLegacyJsonIfEmpty() {

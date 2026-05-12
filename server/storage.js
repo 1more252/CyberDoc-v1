@@ -147,6 +147,26 @@ export function flushSync() {
   try { sqlite.close() } catch { void 0 }
 }
 
+// ---------- introspection (для /health) --------------------------------
+
+export function hasPendingWrites() {
+  return pending !== null
+}
+
+export function getDbPath() {
+  return DB_PATH
+}
+
+// Дешёвый COUNT(*) по таблице users — для sanity-чека что БД жива.
+// Возвращает -1 если запрос упал (БД закрыта/повреждена). Не кидает.
+export function countUsers() {
+  try {
+    return sqlite.prepare('SELECT COUNT(*) AS c FROM "users"').get().c
+  } catch {
+    return -1
+  }
+}
+
 // ---------- legacy JSON import (one-shot) -------------------------------
 //
 // При первом запуске после миграции с JSON: если data/app.db пустая, но есть

@@ -843,7 +843,8 @@ function logAudit(actor, action, target, details = '') {
     details,
     at: Date.now()
   })
-  if (db.audit.length > 500) db.audit.length = 500
+  // Храним последние 5000 записей — ~1–2 дня горячего лога. Глубже — задача SIEM.
+  if (db.audit.length > 5000) db.audit.length = 5000
 }
 
 function adminUserListHandler({ page = 1, pageSize = 20, search = '', role = '' }, caller) {

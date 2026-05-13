@@ -181,6 +181,43 @@ export function countUsers() {
   }
 }
 
+// Per-table статистика: COUNT(*) + SUM(LENGTH(data)). Это «средний размер
+// JSON-сущности» × кол-во → реальная нагрузка на диск, без учёта overhead'а
+// SQLite (страницы, индексы). Достаточно для capacity-планирования.
+// Возвращает { tableName: { rows, bytes } }.
+export function getTableStats() {
+  const stats = {}
+  for (const key of SAVE_KEYS) {
+    try {
+      const row = sqlite
+        .prepare(`SELECT COUNT(*) AS c, COALESCE(SUM(LENGTH(data)), 0) AS b FROM "${key}"`)
+        .get()
+      stats[key] = { rows: row.c, bytes: row.b }
+    } catch (e) {
+      stats[key] = { rows: -1, bytes: -1, error: e.message }
+    }
+  }
+  return stats
+}
+
+// Открывает указанный SQLite-файл в read-only и считает users — sanity-чек
+// что бэкап не битый. Возвращает { ok, users, sizeBytes, error? }.
+// Закрывает соединение сразу — это just-a-probe.
+export function verifyBackup(path) {
+  try {
+    const st = statSync(path)
+    const probe = new Database(path, { readonly: true, fileMustExist: true })
+    try {
+      const row = probe.prepare('SELECT COUNT(*) AS c FROM "users"').get()
+      return { ok: row.c > 0, users: row.c, sizeBytes: st.size }
+    } finally {
+      try { probe.close() } catch { void 0 }
+    }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+}
+
 // WAL-checkpoint(TRUNCATE): переносит -wal в .db и усекает -wal до 0.
 // Возвращает {busy, log, checkpointed}.
 export function walCheckpoint() {

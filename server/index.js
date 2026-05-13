@@ -48,7 +48,9 @@ import {
   countUsers,
   walCheckpoint,
   backupTo,
-  pruneOldBackups
+  pruneOldBackups,
+  getTableStats,
+  verifyBackup
 } from './storage.js'
 import { parseJwt } from '../src/lib/jwt.js'
 
@@ -293,6 +295,19 @@ app.use((req, res, next) => {
 // Дёшево (<1ms) — можно дёргать раз в секунду из uptime-чекера.
 
 const STARTED_AT = Date.now()
+// HEAD-варианты для LB-проб: load-balancer'у не нужно тело, ему достаточно
+// статус-кода. Без app.head() Express 404'ит HEAD-запросы на app.get()-роуты
+// (HEAD не матчится с GET-обработчиком). Делаем чтобы AWS ALB / k8s probe /
+// Pingdom могли использовать HEAD и экономить трафик.
+app.head('/health', (_req, res) => res.status(200).end())
+app.head('/version', (_req, res) => res.status(200).end())
+app.head('/ready', (_req, res) => {
+  if (shuttingDown || READ_ONLY) return res.status(503).end()
+  const users = countUsers()
+  if (users <= 0) return res.status(503).end()
+  res.status(200).end()
+})
+
 app.get('/health', (_req, res) => {
   const mem = process.memoryUsage()
   // Суммируем app.db + -wal + -shm: в WAL-режиме реальные данные лежат
@@ -534,9 +549,42 @@ app.post('/api/admin/backup', (req, res) => {
   const dest = resolve(BACKUP_DIR, `app-${ts}.db`)
   const info = backupTo(dest)
   if (info.error) return res.status(500).json({ ok: false, ...info })
+  // Verify: открыть бэкап в read-only и убедиться что users > 0. Это ловит
+  // случаи «бэкап успешно записан, но битый» — например ext4 partial write.
+  // Стоит ~10ms, делаем всегда (доверять без проверки нечестно).
+  const verify = verifyBackup(dest)
   // Сразу после успешного бэкапа подчищаем старые — чтобы место не копилось.
   const pruned = pruneOldBackups(BACKUP_DIR, BACKUP_KEEP_DAYS)
-  res.json({ ok: true, ...info, pruned })
+  res.json({ ok: verify.ok, ...info, verify, pruned })
+})
+
+// Per-table статистика для capacity-планирования: сколько rows + bytes
+// в каждой таблице, плюс размеры файлов БД/wal. Дешёво (несколько COUNT'ов),
+// можно дёргать по требованию.
+app.get('/api/admin/db-stats', (req, res) => {
+  if (!requireAdmin(req, res)) return
+  const tables = getTableStats()
+  const dbPath = getDbPath()
+  const files = {}
+  for (const suffix of ['', '-wal', '-shm']) {
+    try {
+      const st = statSync(dbPath + suffix)
+      files[suffix || 'db'] = { sizeBytes: st.size, mtime: st.mtime.toISOString() }
+    } catch { /* нет файла — пропускаем */ }
+  }
+  // Сумма по таблицам vs размер файла — расхождение = overhead страниц/индексов.
+  let totalRows = 0
+  let totalBytes = 0
+  for (const t of Object.values(tables)) {
+    if (t.rows > 0) totalRows += t.rows
+    if (t.bytes > 0) totalBytes += t.bytes
+  }
+  res.json({
+    tables,
+    totals: { rows: totalRows, bytes: totalBytes },
+    files,
+    pendingWrites: hasPendingWrites()
+  })
 })
 
 // --- ETag для read-only справочников -----------------------------------

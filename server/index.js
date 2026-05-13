@@ -47,7 +47,8 @@ import {
   getDbPath,
   countUsers,
   walCheckpoint,
-  backupTo
+  backupTo,
+  pruneOldBackups
 } from './storage.js'
 import { parseJwt } from '../src/lib/jwt.js'
 
@@ -83,6 +84,19 @@ const BACKUP_DIR = resolve(HERE, '..', 'data', 'backups')
 // долго) — обычно симптом «висящих» readers или забытого админа. 100MB
 // для нашей нагрузки = аномалия, повод дёрнуть /api/admin/wal-checkpoint.
 const WAL_ALERT_MB = Number(process.env.WAL_ALERT_MB) || 100
+
+// Авто-checkpoint срабатывает заранее, до alert-порога — чтобы админу не
+// приходилось ничего делать руками. По умолчанию 50MB (половина alert'а).
+const WAL_AUTO_CHECKPOINT_MB = Number(process.env.WAL_AUTO_CHECKPOINT_MB) || 50
+
+// Сколько дней хранить бэкапы в data/backups/. Старее — чистятся после
+// каждого создания бэкапа + раз в интервал maintenance.
+const BACKUP_KEEP_DAYS = Number(process.env.BACKUP_KEEP_DAYS) || 30
+
+// Интервал фоновой maintenance-задачи: WAL auto-checkpoint + backup-prune.
+// Дёшево (две stat-операции), можно делать часто. 5 минут — компромисс
+// между «не реагируем на распухание мгновенно» и «не дёргаем диск зря».
+const MAINTENANCE_INTERVAL_MS = Number(process.env.MAINTENANCE_INTERVAL_MS) || 5 * 60_000
 
 // --- bootstrap -----------------------------------------------------------
 
@@ -277,6 +291,21 @@ app.get('/health', (_req, res) => {
   })
 })
 
+// --- /ready -------------------------------------------------------------
+// Liveness vs readiness: /health всегда отвечает «жив» (включая
+// shuttingDown), /ready — «готов принимать трафик». k8s/lb-probe именно
+// сюда смотрит, чтобы вывести pod из ротации до shutdown'а.
+// 200 — готов; 503 — нет (БД пуста / shutdown / read-only).
+
+app.get('/ready', (_req, res) => {
+  if (shuttingDown) return res.status(503).json({ ok: false, reason: 'shutting_down' })
+  if (READ_ONLY) return res.status(503).json({ ok: false, reason: 'read_only' })
+  const users = countUsers()
+  if (users < 0) return res.status(503).json({ ok: false, reason: 'db_unavailable' })
+  if (users === 0) return res.status(503).json({ ok: false, reason: 'db_empty' })
+  res.json({ ok: true })
+})
+
 // --- /metrics (admin-only) ---------------------------------------------
 // JSON-метрики: для интеграции с дашбордом. Считаем accept-roles из bearer-токена,
 // чтобы не тянуть в handlers ради одного эндпоинта.
@@ -441,7 +470,9 @@ app.post('/api/admin/backup', (req, res) => {
   const dest = resolve(BACKUP_DIR, `app-${ts}.db`)
   const info = backupTo(dest)
   if (info.error) return res.status(500).json({ ok: false, ...info })
-  res.json({ ok: true, ...info })
+  // Сразу после успешного бэкапа подчищаем старые — чтобы место не копилось.
+  const pruned = pruneOldBackups(BACKUP_DIR, BACKUP_KEEP_DAYS)
+  res.json({ ok: true, ...info, pruned })
 })
 
 // --- ETag для read-only справочников -----------------------------------
@@ -516,6 +547,41 @@ if (SERVE_STATIC) {
   }
 }
 
+// --- background maintenance --------------------------------------------
+// Раз в MAINTENANCE_INTERVAL_MS:
+//   1. если -wal > WAL_AUTO_CHECKPOINT_MB → flushPending + walCheckpoint
+//   2. чистим старые бэкапы (старее BACKUP_KEEP_DAYS)
+// Дёшево и идемпотентно. Логируем только если что-то реально сделали —
+// чтобы не засорять stdout «no-op» строками каждые 5 минут.
+
+let maintenanceTimer = null
+
+function maintenanceTick() {
+  // 1) WAL auto-checkpoint
+  try {
+    const walPath = getDbPath() + '-wal'
+    let walMB = 0
+    try { walMB = statSync(walPath).size / 1024 / 1024 } catch { /* no wal yet */ }
+    if (walMB > WAL_AUTO_CHECKPOINT_MB) {
+      flushPending()
+      const result = walCheckpoint()
+      console.log(`[maintenance] wal ${walMB.toFixed(1)}MB > ${WAL_AUTO_CHECKPOINT_MB}MB → checkpoint:`, result)
+    }
+  } catch (e) {
+    console.error('[maintenance] wal-checkpoint failed:', e.message)
+  }
+  // 2) Backup retention
+  try {
+    const r = pruneOldBackups(BACKUP_DIR, BACKUP_KEEP_DAYS)
+    if (r.removed.length > 0) {
+      const mb = (r.freedBytes / 1024 / 1024).toFixed(1)
+      console.log(`[maintenance] pruned ${r.removed.length} backup(s), freed ${mb}MB`)
+    }
+  } catch (e) {
+    console.error('[maintenance] backup-prune failed:', e.message)
+  }
+}
+
 // --- graceful shutdown -------------------------------------------------
 // shuttingDown=true → новые /api отбиваются 503. Ждём дренажа inflight до 0
 // (или SHUTDOWN_DRAIN_MS), потом flushSync. Важно для bulk-импорта на 100.
@@ -535,6 +601,11 @@ async function shutdown(signal) {
   if (shuttingDown) return
   shuttingDown = true
   console.log(`\n[server] ${signal} received, draining ${inflight} inflight req…`)
+  // Останавливаем фоновую maintenance (чтобы не дёргать БД во время flushSync).
+  if (maintenanceTimer) {
+    clearInterval(maintenanceTimer)
+    maintenanceTimer = null
+  }
   // close() прекращает приём новых соединений, keep-alive дослуживаются.
   if (httpServer) httpServer.close()
   const drained = await waitForDrain(SHUTDOWN_DRAIN_MS)
@@ -557,4 +628,10 @@ process.on('uncaughtException', (e) => {
 
 httpServer = app.listen(PORT, HOST, () => {
   console.log(`[server] http://${HOST}:${PORT} (static=${SERVE_STATIC ? 'on' : 'off'})`)
+  // Запускаем фоновую maintenance только после успешного listen, чтобы при
+  // ошибке bind'а не лезть в БД. unref() — таймер не блокирует event-loop
+  // exit'а, если кто-то прибил httpServer мимо shutdown'а.
+  maintenanceTimer = setInterval(maintenanceTick, MAINTENANCE_INTERVAL_MS)
+  maintenanceTimer.unref()
+  console.log(`[maintenance] enabled (interval=${Math.round(MAINTENANCE_INTERVAL_MS / 1000)}s, walThreshold=${WAL_AUTO_CHECKPOINT_MB}MB, backupKeep=${BACKUP_KEEP_DAYS}d)`)
 })

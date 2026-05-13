@@ -15,8 +15,8 @@
 // ===========================================================================
 
 import Database from 'better-sqlite3'
-import { mkdirSync, existsSync, statSync, unlinkSync, readFileSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { mkdirSync, existsSync, statSync, unlinkSync, readFileSync, readdirSync } from 'node:fs'
+import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { db } from '../src/mock/db.js'
 
@@ -197,6 +197,30 @@ export function backupTo(destPath) {
   } catch (e) {
     return { path: destPath, error: e.message }
   }
+}
+
+// Чистит старые бэкапы в dir (по mtime). keepDays — сколько дней хранить.
+// Возвращает массив удалённых путей + сколько байт освободили. Безопасно для
+// несуществующей папки — просто вернёт пустой результат.
+export function pruneOldBackups(dir, keepDays) {
+  const cutoff = Date.now() - keepDays * 86400_000
+  const removed = []
+  let freedBytes = 0
+  let files
+  try { files = readdirSync(dir) } catch { return { removed, freedBytes } }
+  for (const name of files) {
+    if (!name.endsWith('.db')) continue
+    const p = join(dir, name)
+    try {
+      const st = statSync(p)
+      if (st.mtimeMs < cutoff) {
+        freedBytes += st.size
+        unlinkSync(p)
+        removed.push(name)
+      }
+    } catch { /* пропускаем недоступные */ }
+  }
+  return { removed, freedBytes }
 }
 
 // ---------- legacy JSON import (one-shot) -------------------------------

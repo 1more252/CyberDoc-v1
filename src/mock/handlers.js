@@ -36,6 +36,61 @@ export function setPasswordHasher({ hash, verify, isHashed }) {
   if (isHashed) pwIsHashed = isHashed
 }
 
+// === PER-ACCOUNT LOGIN LOCKOUT ==========================================
+// In-memory счётчик неудачных попыток входа: после LOGIN_FAILURE_LIMIT
+// промахов в окне LOGIN_FAILURE_WINDOW_MS аккаунт блокируется на
+// LOGIN_LOCKOUT_MS. По дизайну ephemeral (сбрасывается на рестарте) —
+// это анти-bruteforce, а не permanent ban. rate-limit на /api/auth/login
+// в Express бьёт по IP; этот слой бьёт по username (защита от ботнета,
+// который вертит IP но долбит один логин).
+//
+// Чтобы не палить существование пользователя по timing'у, считаем фейлы
+// для любого username (включая несуществующие). loginFailures держит
+// только записи с активным окном — старые лениво вычищаются на следующей
+// попытке того же username.
+const LOGIN_FAILURE_LIMIT = Number(process.env.LOGIN_FAILURE_LIMIT) || 5
+const LOGIN_LOCKOUT_MS = Number(process.env.LOGIN_LOCKOUT_MS) || 15 * 60_000
+const LOGIN_FAILURE_WINDOW_MS = Number(process.env.LOGIN_FAILURE_WINDOW_MS) || 15 * 60_000
+
+// Map<username, { count, firstFailAt, lockedUntil }>
+const loginFailures = new Map()
+
+function checkLockout(username) {
+  const rec = loginFailures.get(username)
+  if (!rec) return 0
+  const now = Date.now()
+  if (rec.lockedUntil > now) return Math.ceil((rec.lockedUntil - now) / 1000)
+  if (rec.lockedUntil > 0 && rec.lockedUntil <= now) {
+    // Lockout истёк — стираем запись, следующая ошибка начнёт окно заново.
+    loginFailures.delete(username)
+  }
+  return 0
+}
+
+function recordLoginFailure(username) {
+  const now = Date.now()
+  let rec = loginFailures.get(username)
+  if (!rec || (now - rec.firstFailAt) > LOGIN_FAILURE_WINDOW_MS) {
+    rec = { count: 0, firstFailAt: now, lockedUntil: 0 }
+    loginFailures.set(username, rec)
+  }
+  rec.count++
+  if (rec.count >= LOGIN_FAILURE_LIMIT) {
+    rec.lockedUntil = now + LOGIN_LOCKOUT_MS
+  }
+}
+
+function clearLoginFailures(username) {
+  loginFailures.delete(username)
+}
+
+// Test/admin helper: позволяет вручную сбросить локаут (для тестов и
+// /api/admin/unlock-user в будущем).
+export function _resetLoginFailures(username) {
+  if (username) loginFailures.delete(username)
+  else loginFailures.clear()
+}
+
 const RU_COLLATOR = new Intl.Collator('ru')
 const cmpRu = RU_COLLATOR.compare
 
@@ -270,11 +325,36 @@ export async function handleMockRequest({ method, url, body, headers }) {
 async function loginHandler(body, headers) {
   const username = String(body?.username ?? '')
   const password = String(body?.password ?? '')
+
+  // 1. Лок-чек до обращения к БД и pwVerify (scrypt дорогой) — даже если
+  // юзер закидывает запросами, мы быстро отбиваемся.
+  const lockedFor = checkLockout(username)
+  if (lockedFor > 0) {
+    const minutes = Math.ceil(lockedFor / 60)
+    return {
+      status: 429,
+      data: {
+        error: 'account_locked',
+        message: `Слишком много неудачных попыток. Аккаунт временно заблокирован, попробуйте через ${minutes} мин.`,
+        retryAfterSec: lockedFor
+      }
+    }
+  }
+
   const idx = db.users.findIndex((x) => x.username === username)
-  if (idx < 0) return { status: 401, data: { error: 'Неверный логин или пароль' } }
-  const u = db.users[idx]
-  if (!(await pwVerify(password, u.password)))
+  if (idx < 0) {
+    // Считаем фейл даже для несуществующих логинов — иначе атакующий
+    // отличает «нет такого юзера» (без лимита) от «есть, но пароль не тот».
+    recordLoginFailure(username)
     return { status: 401, data: { error: 'Неверный логин или пароль' } }
+  }
+  const u = db.users[idx]
+  if (!(await pwVerify(password, u.password))) {
+    recordLoginFailure(username)
+    return { status: 401, data: { error: 'Неверный логин или пароль' } }
+  }
+  // Успех — гасим счётчик, чтобы прошлые промахи не накапливались.
+  clearLoginFailures(username)
   // Ленивая миграция: первый успешный логин для legacy plain → пересохраняем hash.
   if (!pwIsHashed(u.password)) {
     db.users.splice(idx, 1, { ...u, password: await pwHash(password) })

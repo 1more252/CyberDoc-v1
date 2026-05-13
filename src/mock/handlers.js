@@ -91,6 +91,41 @@ export function _resetLoginFailures(username) {
   else loginFailures.clear()
 }
 
+// === CREDENTIAL VALIDATION ==============================================
+// Пароль: min 8 символов, не только цифры (защита от 12345678), хотя бы
+// одна буква. Жёстко не требуем смешанный регистр / спец-символы — UX
+// важнее, чем «security theater». Длина — главный фактор bruteforce-стойкости.
+//
+// Логин: 3..32 ASCII-символа [a-zA-Z0-9._-], не начинается с точки/дефиса.
+// Кириллицу запрещаем — иначе collation-edge-cases в SQL-сравнениях.
+const PASSWORD_MIN_LEN = Number(process.env.PASSWORD_MIN_LEN) || 8
+const PASSWORD_MAX_LEN = 200
+const USERNAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{2,31}$/
+
+function validatePassword(pw) {
+  if (typeof pw !== 'string' || pw.length < PASSWORD_MIN_LEN) {
+    return `Пароль должен быть не короче ${PASSWORD_MIN_LEN} символов`
+  }
+  if (pw.length > PASSWORD_MAX_LEN) {
+    return `Пароль слишком длинный (>${PASSWORD_MAX_LEN} символов)`
+  }
+  if (/^\d+$/.test(pw)) {
+    return 'Пароль не может состоять только из цифр'
+  }
+  if (!/[a-zA-Zа-яА-ЯёЁ]/.test(pw)) {
+    return 'Пароль должен содержать хотя бы одну букву'
+  }
+  return null
+}
+
+function validateUsername(username) {
+  if (typeof username !== 'string') return 'Некорректный логин'
+  if (!USERNAME_RE.test(username)) {
+    return 'Логин: 3–32 латинских символа/цифры, можно ._-, начало — буква или цифра'
+  }
+  return null
+}
+
 const RU_COLLATOR = new Intl.Collator('ru')
 const cmpRu = RU_COLLATOR.compare
 
@@ -303,13 +338,26 @@ export async function handleMockRequest({ method, url, body, headers }) {
 
   // === ADMIN: users =====================================================
   const adminUserMatch = path.match(/^\/admin\/users\/([^/]+)$/)
-  const adminUserActionMatch = path.match(/^\/admin\/users\/([^/]+)\/(verify|block|role|password)$/)
+  const adminUserActionMatch = path.match(/^\/admin\/users\/([^/]+)\/(verify|block|role|password|unlock)$/)
   if (method === 'GET' && path === '/admin/users')
     return adminUserListHandler(parseQuery(url), getCaller(headers))
   if (method === 'POST' && adminUserActionMatch)
     return adminUserActionHandler(adminUserActionMatch[1], adminUserActionMatch[2], body, getCaller(headers))
   if (method === 'DELETE' && adminUserMatch)
     return adminUserDeleteHandler(adminUserMatch[1], getCaller(headers))
+
+  // === ADMIN: sessions ==================================================
+  // GET    /admin/sessions[?username=X]  — список (всех или фильтр)
+  // DELETE /admin/sessions/:id           — отзыв любой сессии (есть и в /auth/, но та для своих)
+  // POST   /admin/users/:u/logout-all    — массовый отзыв всех сессий юзера
+  const adminSessionIdMatch = path.match(/^\/admin\/sessions\/([^/]+)$/)
+  const adminLogoutAllMatch = path.match(/^\/admin\/users\/([^/]+)\/logout-all$/)
+  if (method === 'GET' && path === '/admin/sessions')
+    return adminSessionsListHandler(parseQuery(url), getCaller(headers))
+  if (method === 'DELETE' && adminSessionIdMatch)
+    return adminSessionsDeleteHandler(adminSessionIdMatch[1], getCaller(headers))
+  if (method === 'POST' && adminLogoutAllMatch)
+    return adminLogoutAllHandler(adminLogoutAllMatch[1], getCaller(headers))
 
   // === Журнал действий и статистика =====================================
   if (method === 'GET' && path === '/audit')
@@ -373,6 +421,10 @@ async function loginHandler(body, headers) {
 async function registerHandler(body) {
   if (!body?.username || !body?.password || !body?.email)
     return { status: 400, data: { error: 'Заполните все поля' } }
+  const userErr = validateUsername(body.username)
+  if (userErr) return { status: 400, data: { error: 'invalid_username', message: userErr } }
+  const pwErr = validatePassword(body.password)
+  if (pwErr) return { status: 400, data: { error: 'invalid_password', message: pwErr } }
   if (db.users.some((x) => x.username === body.username))
     return { status: 409, data: { error: 'Пользователь с таким логином уже есть' } }
   db.users.push({
@@ -393,6 +445,16 @@ function refreshHandler(body, headers) {
   if (!username) return { status: 401, data: { error: 'invalid_refresh' } }
   const u = db.users.find((x) => x.username === username)
   if (!u) return { status: 401, data: { error: 'invalid_refresh' } }
+  // TTL-чек: absolute lifetime + idle timeout. Если сессия слишком стара ИЛИ
+  // ей не пользовались дольше idle — отзываем и требуем повторный login.
+  const meta = db.refreshTokenMeta.find((s) => s.token === body.refreshToken)
+  if (meta) {
+    const now = Date.now()
+    if ((now - meta.createdAt) > REFRESH_TTL_MS || (now - meta.lastUsed) > REFRESH_IDLE_MS) {
+      revokeSession(body.refreshToken)
+      return { status: 401, data: { error: 'session_expired' } }
+    }
+  }
   const token = makeAccessToken({
     username: u.username,
     role: u.role,
@@ -416,6 +478,32 @@ function logoutHandler(body) {
 // refreshTokens (Map) + refreshTokenMeta (array) обновляются вместе.
 // Источник истины — массив (он персистится в SQLite); Map — это derived view
 // для O(1) lookup. Обе структуры должны быть в синхроне.
+//
+// TTL: absolute (30d) и idle (7d). После absolute сессия гарантированно
+// мертва — клиент идёт через login заново. Idle защищает от «забытых
+// токенов на старом ноутбуке»: не использовался неделю — отзываем.
+// Cleanup делается лениво при refresh + раз в maintenance-tick.
+
+const REFRESH_TTL_MS = Number(process.env.REFRESH_TTL_MS) || 30 * 86400_000
+const REFRESH_IDLE_MS = Number(process.env.REFRESH_IDLE_MS) || 7 * 86400_000
+
+// Чистит просроченные сессии. Возвращает кол-во удалённых. Идемпотентно.
+// Вызывается из server/index.js в maintenance-tick.
+export function cleanupExpiredSessions() {
+  const now = Date.now()
+  const before = db.refreshTokenMeta.length
+  const survivors = []
+  for (const s of db.refreshTokenMeta) {
+    const expired = (now - s.createdAt) > REFRESH_TTL_MS || (now - s.lastUsed) > REFRESH_IDLE_MS
+    if (expired) {
+      db.refreshTokens.delete(s.token)
+    } else {
+      survivors.push(s)
+    }
+  }
+  if (survivors.length !== before) db.refreshTokenMeta = survivors
+  return before - survivors.length
+}
 
 function registerSession(token, username, headers) {
   const now = Date.now()
@@ -474,6 +562,56 @@ function sessionsDeleteHandler(sessionId, caller) {
   return { status: 200, data: { ok: true } }
 }
 
+// ---------- admin sessions ----------
+// «Дублирующие» эндпоинты под /admin/* для админ-консоли: тот же стор,
+// другой scope (любой юзер). Это удобно для UI: фронт не должен знать
+// «можно ли админу дёрнуть /auth/sessions с username=...». Маршруты
+// явные, права проверяются здесь.
+
+function adminSessionsListHandler({ username = '' }, caller) {
+  const guard = requireAdmin(caller)
+  if (guard) return guard
+  const filter = String(username || '').trim()
+  let items = db.refreshTokenMeta
+  if (filter) items = items.filter((s) => s.username === filter)
+  return {
+    status: 200,
+    data: {
+      items: items
+        .map((s) => ({
+          id: s.id,
+          username: s.username,
+          createdAt: s.createdAt,
+          lastUsed: s.lastUsed,
+          userAgent: s.userAgent
+        }))
+        .sort((a, b) => b.lastUsed - a.lastUsed),
+      total: items.length
+    }
+  }
+}
+
+function adminSessionsDeleteHandler(sessionId, caller) {
+  const guard = requireAdmin(caller)
+  if (guard) return guard
+  const idx = db.refreshTokenMeta.findIndex((s) => s.id === sessionId)
+  if (idx < 0) return { status: 404, data: { error: 'not_found' } }
+  const sess = db.refreshTokenMeta[idx]
+  revokeSession(sess.token)
+  logAudit(caller.username, 'session.revoke', sess.username, `сессия ${sess.id}`)
+  return { status: 200, data: { ok: true } }
+}
+
+function adminLogoutAllHandler(username, caller) {
+  const guard = requireAdmin(caller)
+  if (guard) return guard
+  // Считаем сессии до отзыва — для аудита и ответа.
+  const before = db.refreshTokenMeta.filter((s) => s.username === username).length
+  revokeAllSessionsOf(username)
+  logAudit(caller.username, 'session.logout-all', username, `отозвано ${before} сессий`)
+  return { status: 200, data: { ok: true, revoked: before } }
+}
+
 function meHandler(headers) {
   const auth = headers?.authorization
   if (!auth?.startsWith('Bearer ')) return { status: 401, data: { error: 'no_token' } }
@@ -499,7 +637,8 @@ async function changePasswordHandler(body, caller) {
   const current = String(body?.currentPassword ?? '')
   const next = String(body?.newPassword ?? '')
   if (!current || !next) return { status: 400, data: { error: 'missing_fields' } }
-  if (next.length < 6) return { status: 400, data: { error: 'password_too_short' } }
+  const pwErr = validatePassword(next)
+  if (pwErr) return { status: 400, data: { error: 'invalid_password', message: pwErr } }
   if (next === current) return { status: 400, data: { error: 'password_same' } }
   const idx = db.users.findIndex((x) => x.username === caller.username)
   if (idx === -1) return { status: 404, data: { error: 'no_user' } }
@@ -1119,12 +1258,22 @@ async function adminUserActionHandler(username, action, body, caller) {
 
   if (action === 'password') {
     const password = String(body?.password ?? '')
-    if (password.length < 6)
-      return { status: 400, data: { error: 'password_too_short' } }
+    const pwErr = validatePassword(password)
+    if (pwErr) return { status: 400, data: { error: 'invalid_password', message: pwErr } }
     db.users.splice(idx, 1, { ...u, password: await pwHash(password) })
     revokeAllSessionsOf(username)
     logAudit(caller.username, 'user.password', username, 'пароль изменён')
     return { status: 200, data: publicUser(db.users[idx]) }
+  }
+
+  if (action === 'unlock') {
+    // Сбрасывает счётчик неудачных попыток (per-account lockout). Не путать
+    // с `block=false` — это разные слои: lockout — анти-bruteforce,
+    // blocked — административный бан.
+    const had = loginFailures.has(username)
+    loginFailures.delete(username)
+    logAudit(caller.username, 'user.unlock', username, had ? 'снят лок' : 'локаут не был активен')
+    return { status: 200, data: { ok: true, wasLocked: had } }
   }
 
   return { status: 400, data: { error: 'unknown_action' } }

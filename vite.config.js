@@ -24,6 +24,10 @@ export default defineConfig({
     format: 'es'
   },
   server: {
+    // На Windows Vite по умолчанию биндится на IPv6 (::1), а curl/браузер
+    // через localhost резолвят в IPv4 (127.0.0.1) — получается «страница
+    // недоступна». Явно фиксируем IPv4-loopback.
+    host: '127.0.0.1',
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:3001',

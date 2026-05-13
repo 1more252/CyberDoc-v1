@@ -34,7 +34,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import { existsSync, statSync, mkdirSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher } from '../src/mock/handlers.js'
+import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher, cleanupExpiredSessions } from '../src/mock/handlers.js'
 import { makeAccessToken, makeRefreshToken } from './jwt.js'
 import { hash as pwHash, verify as pwVerify, isHashed as pwIsHashed } from './password.js'
 import {
@@ -579,6 +579,17 @@ function maintenanceTick() {
     }
   } catch (e) {
     console.error('[maintenance] backup-prune failed:', e.message)
+  }
+  // 3) Expired refresh-sessions: чистим, чтобы массив не рос вечно.
+  try {
+    const n = cleanupExpiredSessions()
+    if (n > 0) {
+      console.log(`[maintenance] expired ${n} refresh-session(s)`)
+      // Сразу планируем save: чтобы persisted db не отставал.
+      scheduleSave()
+    }
+  } catch (e) {
+    console.error('[maintenance] session-cleanup failed:', e.message)
   }
 }
 

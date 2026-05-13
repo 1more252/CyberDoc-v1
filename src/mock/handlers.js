@@ -175,11 +175,11 @@ export async function handleMockRequest({ method, url, body, headers }) {
 
   // === AUTH =============================================================
   if (method === 'POST' && path === '/auth/login') return loginHandler(body, headers)
-  if (method === 'POST' && path === '/auth/register') return registerHandler(body)
+  if (method === 'POST' && path === '/auth/register') return registerHandler(body, headers)
   if (method === 'POST' && path === '/auth/refresh') return refreshHandler(body, headers)
   if (method === 'POST' && path === '/auth/logout') return logoutHandler(body)
   if (method === 'GET' && path === '/auth/me') return meHandler(headers)
-  if (method === 'POST' && path === '/auth/password') return changePasswordHandler(body, getCaller(headers))
+  if (method === 'POST' && path === '/auth/password') return changePasswordHandler(body, getCaller(headers), headers)
 
   // === AUTH: sessions (refresh-token store) ============================
   const sessionIdMatch = path.match(/^\/auth\/sessions\/([^/]+)$/)
@@ -386,12 +386,15 @@ export async function handleMockRequest({ method, url, body, headers }) {
 async function loginHandler(body, headers) {
   const username = String(body?.username ?? '')
   const password = String(body?.password ?? '')
+  const ip = String(headers?.['x-real-ip'] ?? '')
 
   // 1. Лок-чек до обращения к БД и pwVerify (scrypt дорогой) — даже если
   // юзер закидывает запросами, мы быстро отбиваемся.
   const lockedFor = checkLockout(username)
   if (lockedFor > 0) {
     const minutes = Math.ceil(lockedFor / 60)
+    // Audit: эти события — сигнал «кого-то долбят». Видно в /audit и в SIEM.
+    logAudit(username || '(anon)', 'auth.login.locked', username, `lock ${minutes}мин`, ip)
     return {
       status: 429,
       data: {
@@ -407,11 +410,13 @@ async function loginHandler(body, headers) {
     // Считаем фейл даже для несуществующих логинов — иначе атакующий
     // отличает «нет такого юзера» (без лимита) от «есть, но пароль не тот».
     recordLoginFailure(username)
+    logAudit(username || '(anon)', 'auth.login.fail', username, 'unknown_user', ip)
     return { status: 401, data: { error: 'Неверный логин или пароль' } }
   }
   const u = db.users[idx]
   if (!(await pwVerify(password, u.password))) {
     recordLoginFailure(username)
+    logAudit(username, 'auth.login.fail', username, 'wrong_password', ip)
     return { status: 401, data: { error: 'Неверный логин или пароль' } }
   }
   // Успех — гасим счётчик, чтобы прошлые промахи не накапливались.
@@ -428,10 +433,11 @@ async function loginHandler(body, headers) {
   })
   const refreshToken = makeRefreshToken(u.username)
   registerSession(refreshToken, u.username, headers)
+  logAudit(u.username, 'auth.login.ok', u.username, u.role, ip)
   return { status: 200, data: { token, refreshToken } }
 }
 
-async function registerHandler(body) {
+async function registerHandler(body, headers) {
   if (!body?.username || !body?.password || !body?.email)
     return { status: 400, data: { error: 'Заполните все поля' } }
   const userErr = validateUsername(body.username)
@@ -450,6 +456,8 @@ async function registerHandler(body) {
     blocked: false,
     createdAt: Date.now()
   })
+  const ip = String(headers?.['x-real-ip'] ?? '')
+  logAudit(body.username, 'auth.register', body.username, body.email, ip)
   return { status: 201, data: { ok: true } }
 }
 
@@ -645,7 +653,7 @@ function meHandler(headers) {
   }
 }
 
-async function changePasswordHandler(body, caller) {
+async function changePasswordHandler(body, caller, headers) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const current = String(body?.currentPassword ?? '')
   const next = String(body?.newPassword ?? '')
@@ -658,6 +666,8 @@ async function changePasswordHandler(body, caller) {
   const u = db.users[idx]
   if (!(await pwVerify(current, u.password))) return { status: 400, data: { error: 'wrong_current' } }
   db.users.splice(idx, 1, { ...u, password: await pwHash(next) })
+  const ip = String(headers?.['x-real-ip'] ?? '')
+  logAudit(caller.username, 'auth.password.change', caller.username, 'self', ip)
   return { status: 200, data: { ok: true } }
 }
 
@@ -1144,15 +1154,20 @@ function publicUser(u) {
   }
 }
 
-function logAudit(actor, action, target, details = '') {
-  db.audit.unshift({
+function logAudit(actor, action, target, details = '', ip = '') {
+  const entry = {
     id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     actor,
     action,
     target,
     details,
     at: Date.now()
-  })
+  }
+  // IP — опционален: старые вызовы (4 аргумента) его не передают, новые
+  // (логин, регистрация, смена пароля) — передают. Не пишем пустое поле,
+  // чтобы JSON-storage не пух от undefined.
+  if (ip) entry.ip = ip
+  db.audit.unshift(entry)
   // Храним последние 5000 записей — ~1–2 дня горячего лога. Глубже — задача SIEM.
   if (db.audit.length > 5000) db.audit.length = 5000
 }
@@ -1610,26 +1625,58 @@ function infoSystemDeleteHandler(id, caller) {
 
 // ---------- audit + statistics ----------
 
-function auditListHandler({ page = 1, pageSize = 50, action = '', search = '' }, caller) {
+function auditListHandler(
+  { page = 1, pageSize = 50, action = '', search = '', actor = '', dateFrom = '', dateTo = '' },
+  caller
+) {
   const guard = requireAdmin(caller)
   if (guard) return guard
   const p = Number(page) || 1
   const ps = clampPageSize(pageSize, 50)
   const q = String(search || '').trim().toLowerCase()
+  const actorQ = String(actor || '').trim().toLowerCase()
+  // dateFrom/dateTo принимаем как ISO-строки или unix-ms. Невалидные —
+  // игнорируем (не валим запрос). Преобразуем в ms.
+  const tsFrom = toMs(dateFrom)
+  const tsTo = toMs(dateTo)
 
   let items = db.audit
   if (action) items = items.filter((a) => a.action === action)
+  if (actorQ) items = items.filter((a) => a.actor.toLowerCase() === actorQ)
+  if (tsFrom !== null) items = items.filter((a) => a.at >= tsFrom)
+  // tsTo интерпретируем как «включительно до конца суток», если передали без
+  // времени (YYYY-MM-DD → 00:00:00 → +1 день). Простейший хак: +24h при наличии.
+  if (tsTo !== null) {
+    const upper = isDateOnly(dateTo) ? tsTo + 86400_000 - 1 : tsTo
+    items = items.filter((a) => a.at <= upper)
+  }
   if (q) {
     items = items.filter(
       (a) =>
         a.actor.toLowerCase().includes(q) ||
         a.target.toLowerCase().includes(q) ||
-        (a.details ?? '').toLowerCase().includes(q)
+        (a.details ?? '').toLowerCase().includes(q) ||
+        (a.ip ?? '').toLowerCase().includes(q)
     )
   }
   const total = items.length
   const start = (p - 1) * ps
   return { status: 200, data: { items: items.slice(start, start + ps), total } }
+}
+
+// Хелперы парсинга дат: принимаем 'YYYY-MM-DD', ISO-строку, или unix-ms.
+// Возвращаем ms или null если невалидно.
+function toMs(v) {
+  if (!v) return null
+  const s = String(v).trim()
+  if (!s) return null
+  const n = Number(s)
+  if (Number.isFinite(n) && n > 1e10) return n   // unix ms (≈ после 1970+)
+  const t = Date.parse(s)
+  return Number.isFinite(t) ? t : null
+}
+function isDateOnly(v) {
+  return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v.trim())
 }
 
 function statisticsHandler(caller) {

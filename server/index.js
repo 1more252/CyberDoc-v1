@@ -339,6 +339,22 @@ app.get('/health', (_req, res) => {
   })
 })
 
+// --- /version -----------------------------------------------------------
+// Тонкий endpoint для ops: «какая версия сейчас крутится?». Не требует
+// аутентификации (это публичный fingerprint билда). VCS_SHA — короткий
+// git-hash, прокидывается CI/build-системой. Если нет — пусто.
+
+app.get('/version', (_req, res) => {
+  res.json({
+    version: process.env.npm_package_version || '0.0.0',
+    node: process.version,
+    env: process.env.NODE_ENV || 'development',
+    commit: process.env.VCS_SHA || '',
+    startedAt: new Date(STARTED_AT).toISOString(),
+    uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000)
+  })
+})
+
 // --- /ready -------------------------------------------------------------
 // Liveness vs readiness: /health всегда отвечает «жив» (включая
 // shuttingDown), /ready — «готов принимать трафик». k8s/lb-probe именно
@@ -544,7 +560,11 @@ app.all(/^\/api(\/.*)?$/, async (req, res) => {
   const url = req.originalUrl.replace(/^\/api/, '') || '/'
   const headers = {
     authorization: req.headers.authorization,
-    'user-agent': req.headers['user-agent']
+    'user-agent': req.headers['user-agent'],
+    // `x-real-ip`: синтетический хедер от dispatcher'а. Берём req.ip (Express
+    // учитывает TRUST_PROXY и X-Forwarded-For). Хендлеры не должны парсить
+    // X-Forwarded-For сами — это работа сервера.
+    'x-real-ip': req.ip
   }
   try {
     const result = await handleMockRequest({

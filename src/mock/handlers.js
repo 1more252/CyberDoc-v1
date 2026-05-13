@@ -126,6 +126,19 @@ function validateUsername(username) {
   return null
 }
 
+// === PAGE-SIZE CLAMP ====================================================
+// Защита от `?pageSize=999999`: возвращать огромные массивы — это и память,
+// и сеть, и время сериализации. Все list-хендлеры пропускают `pageSize`
+// через clampPageSize → max 200 (или 500 для тех, кому исторически надо).
+// fallback на дефолт сохраняется (пустой/невалидный → подставляем).
+const PAGE_SIZE_HARD_MAX = Number(process.env.PAGE_SIZE_HARD_MAX) || 500
+
+function clampPageSize(raw, fallback, max = 200) {
+  const n = Math.floor(Number(raw))
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.min(n, Math.min(max, PAGE_SIZE_HARD_MAX))
+}
+
 const RU_COLLATOR = new Intl.Collator('ru')
 const cmpRu = RU_COLLATOR.compare
 
@@ -653,7 +666,7 @@ async function changePasswordHandler(body, caller) {
 function orgListHandler({ page = 1, pageSize = 20, search = '' }, caller) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 20
+  const ps = clampPageSize(pageSize, 20)
   const q = String(search || '').trim().toLowerCase()
 
   let items = db.organizations
@@ -763,7 +776,8 @@ function fnsLookupHandler(body, caller) {
 function innListHandler({ search = '', page = 1, pageSize = 100 }, caller) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const p = Number(page) || 1
-  const ps = Math.min(Number(pageSize) || 100, 500)
+  // ИНН-реестр исторически разрешает page=500 (bulk-импорт справочников).
+  const ps = clampPageSize(pageSize, 100, 500)
   const q = String(search || '').trim().toLowerCase()
   let items = db.innRegistry.filter((x) => x.ownerUsername === caller.username)
   if (q) {
@@ -832,7 +846,7 @@ function equipmentListHandler(
 ) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 20
+  const ps = clampPageSize(pageSize, 20)
   const q = String(search || '').trim().toLowerCase()
 
   let items = db.equipment
@@ -957,7 +971,7 @@ function docListHandler(
 ) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 20
+  const ps = clampPageSize(pageSize, 20)
   const q = String(search || '').trim().toLowerCase()
 
   let items = db.documents
@@ -1178,7 +1192,7 @@ function adminUserListHandler({ page = 1, pageSize = 20, search = '', role = '' 
   const guard = requireAdmin(caller)
   if (guard) return guard
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 20
+  const ps = clampPageSize(pageSize, 20)
   const q = String(search || '').trim().toLowerCase()
 
   let items = db.users
@@ -1298,7 +1312,7 @@ function personalListHandler(
 ) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 20
+  const ps = clampPageSize(pageSize, 20)
   const q = String(search || '').trim().toLowerCase()
 
   // Берём предсортированный кеш и фильтруем (filter сохраняет порядок) —
@@ -1469,7 +1483,7 @@ function infoSystemListHandler(
 ) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 20
+  const ps = clampPageSize(pageSize, 20)
   const q = String(search || '').trim().toLowerCase()
 
   let items = db.infoSystems
@@ -1600,7 +1614,7 @@ function auditListHandler({ page = 1, pageSize = 50, action = '', search = '' },
   const guard = requireAdmin(caller)
   if (guard) return guard
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 50
+  const ps = clampPageSize(pageSize, 50)
   const q = String(search || '').trim().toLowerCase()
 
   let items = db.audit
@@ -1653,7 +1667,7 @@ function softwareListHandler(
 ) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 20
+  const ps = clampPageSize(pageSize, 20)
   const q = String(search || '').trim().toLowerCase()
 
   let items = db.software
@@ -1785,7 +1799,7 @@ function stCatalogListHandler(
 ) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 50
+  const ps = clampPageSize(pageSize, 50)
   const q = String(search || '').trim().toLowerCase()
 
   let items = db.securityToolsCatalog
@@ -1884,7 +1898,7 @@ function stListHandler(
 ) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 20
+  const ps = clampPageSize(pageSize, 20)
   const q = String(search || '').trim().toLowerCase()
 
   const catalogIndex = new Map(db.securityToolsCatalog.map((c) => [c.id, c]))
@@ -2061,7 +2075,7 @@ function dsListHandler(
 ) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 20
+  const ps = clampPageSize(pageSize, 20)
 
   let items = db.documentSets
   if (caller.role === 'user') items = items.filter((d) => d.ownerUsername === caller.username)
@@ -2194,7 +2208,7 @@ function tmListHandler(
 ) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   const p = Number(page) || 1
-  const ps = Number(pageSize) || 20
+  const ps = clampPageSize(pageSize, 20)
 
   let items = db.threatModels
   if (caller.role === 'user') items = items.filter((m) => m.ownerUsername === caller.username)

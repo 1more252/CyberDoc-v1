@@ -98,6 +98,14 @@ const BACKUP_KEEP_DAYS = Number(process.env.BACKUP_KEEP_DAYS) || 30
 // между «не реагируем на распухание мгновенно» и «не дёргаем диск зря».
 const MAINTENANCE_INTERVAL_MS = Number(process.env.MAINTENANCE_INTERVAL_MS) || 5 * 60_000
 
+// Максимальная длина любого строкового поля в JSON-body. Защищает от
+// `name='A'.repeat(10MB)` — без этого DB пухнет, search-индексы тормозят,
+// list-ответы превращаются в мегабайты. 64KB достаточно для документов
+// (HTML/markdown), на 2 порядка меньше body-limit (10MB).
+const MAX_FIELD_LEN = Number(process.env.MAX_FIELD_LEN) || 65_536
+// Глубина рекурсии при clamp'е — защита от циклических/глубоких структур.
+const MAX_FIELD_DEPTH = 16
+
 // --- bootstrap -----------------------------------------------------------
 
 setMockDelayMs(0)
@@ -150,6 +158,46 @@ if (READ_ONLY) console.warn('[server] READ_ONLY mode: mutations will return 503'
 // gzip всех ответов >1KB. JSON-ответы списков сжимаются в 4–10×.
 app.use(compression({ threshold: 1024 }))
 app.use(express.json({ limit: '10mb' }))
+
+// --- field-length clamp ------------------------------------------------
+// Идёт сразу после json-парсера: каждое строковое поле в req.body
+// усекается до MAX_FIELD_LEN. Это in-place, мутирует input — хендлеры
+// получают уже-обработанные данные, обходных путей нет. На non-object
+// body (массив, null) применяется тот же walker, который умеет рекурсию.
+//
+// Trade-off: иногда обрезание невидимо для пользователя — поэтому добавляем
+// маркер `[…clamped:N]` в конец, чтобы при debug'е было ясно. На клиенте
+// это не парсится (просто часть строки), на сервере отличимо.
+
+function clampStrings(node, depth) {
+  if (depth > MAX_FIELD_DEPTH) return node
+  if (node === null || typeof node !== 'object') return node
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i++) {
+      const v = node[i]
+      if (typeof v === 'string') {
+        if (v.length > MAX_FIELD_LEN) node[i] = v.slice(0, MAX_FIELD_LEN) + `[…clamped:${v.length}]`
+      } else if (v && typeof v === 'object') {
+        clampStrings(v, depth + 1)
+      }
+    }
+    return node
+  }
+  for (const k of Object.keys(node)) {
+    const v = node[k]
+    if (typeof v === 'string') {
+      if (v.length > MAX_FIELD_LEN) node[k] = v.slice(0, MAX_FIELD_LEN) + `[…clamped:${v.length}]`
+    } else if (v && typeof v === 'object') {
+      clampStrings(v, depth + 1)
+    }
+  }
+  return node
+}
+
+app.use((req, _res, next) => {
+  if (req.body && typeof req.body === 'object') clampStrings(req.body, 0)
+  next()
+})
 
 // --- inflight tracking + request-id + structured logging ---------------
 // Каждый запрос получает UUID (в X-Request-Id и логах). Inflight считаем

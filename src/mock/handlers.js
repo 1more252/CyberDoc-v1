@@ -537,6 +537,14 @@ function logoutHandler(body) {
 const REFRESH_TTL_MS = Number(process.env.REFRESH_TTL_MS) || 30 * 86400_000
 const REFRESH_IDLE_MS = Number(process.env.REFRESH_IDLE_MS) || 7 * 86400_000
 
+// Максимум одновременных refresh-сессий на одного юзера. При превышении —
+// FIFO eviction (выкидываем самую старую по createdAt), новая сессия проходит.
+// Альтернатива «отбить новый логин» = DoS на легитимного юзера: достаточно
+// одного «протухшего» tab'а из 5 чтобы он не смог залогиниться. Поэтому
+// предпочитаем silent revoke старой + audit-запись для трейсабельности.
+// 5 покрывает realistic-сценарий (десктоп + ноут + телефон + работа + запас).
+const SESSIONS_PER_USER_MAX = Number(process.env.SESSIONS_PER_USER_MAX) || 5
+
 // Чистит просроченные сессии. Возвращает кол-во удалённых. Идемпотентно.
 // Вызывается из server/index.js в maintenance-tick.
 export function cleanupExpiredSessions() {
@@ -558,6 +566,7 @@ export function cleanupExpiredSessions() {
 function registerSession(token, username, headers) {
   const now = Date.now()
   const ua = String(headers?.['user-agent'] ?? '').slice(0, 200)
+  const ip = String(headers?.['x-real-ip'] ?? '').slice(0, 64)
   db.refreshTokens.set(token, username)
   db.refreshTokenMeta.push({
     id: `sess-${now}-${Math.random().toString(36).slice(2, 8)}`,
@@ -567,6 +576,35 @@ function registerSession(token, username, headers) {
     lastUsed: now,
     userAgent: ua
   })
+  // FIFO eviction: после вставки новая сессия — последняя из ≤MAX. Если у юзера
+  // больше — выкидываем самые старые (по createdAt asc). Делать ПОСЛЕ push,
+  // чтобы новая всегда выжила (см. doc выше про DoS). Линейный проход дёшев:
+  // на одного юзера обычно <10 записей.
+  enforceSessionQuota(username, ip)
+}
+
+// Подрезает refresh-сессии конкретного юзера до SESSIONS_PER_USER_MAX.
+// Удаляемые — самые старые по createdAt; синхронно вычищает их из db.refreshTokens
+// и пишет audit-запись `session_evicted` с reason=`over_quota`. Идемпотентна
+// (≤MAX → no-op). Возвращает кол-во удалённых.
+function enforceSessionQuota(username, ip = '') {
+  const own = db.refreshTokenMeta.filter((s) => s.username === username)
+  if (own.length <= SESSIONS_PER_USER_MAX) return 0
+  own.sort((a, b) => a.createdAt - b.createdAt)
+  const victims = own.slice(0, own.length - SESSIONS_PER_USER_MAX)
+  const victimIds = new Set(victims.map((s) => s.id))
+  for (const v of victims) db.refreshTokens.delete(v.token)
+  db.refreshTokenMeta = db.refreshTokenMeta.filter((s) => !victimIds.has(s.id))
+  // Один audit-record на eviction-волну (а не на каждую сессию): меньше шума,
+  // details содержат IDs всех удалённых. Detector в SIEM ловит этот action.
+  logAudit(
+    username,
+    'session_evicted',
+    `user:${username}`,
+    `reason=over_quota max=${SESSIONS_PER_USER_MAX} evicted=${victims.map((v) => v.id).join(',')}`,
+    ip
+  )
+  return victims.length
 }
 
 function revokeSession(token) {

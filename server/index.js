@@ -34,7 +34,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import { existsSync, statSync, mkdirSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher, cleanupExpiredSessions } from '../src/mock/handlers.js'
+import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher, cleanupExpiredSessions, cleanupAudit } from '../src/mock/handlers.js'
 import { makeAccessToken, makeRefreshToken } from './jwt.js'
 import { hash as pwHash, verify as pwVerify, isHashed as pwIsHashed } from './password.js'
 import {
@@ -94,6 +94,12 @@ const WAL_AUTO_CHECKPOINT_MB = Number(process.env.WAL_AUTO_CHECKPOINT_MB) || 50
 // Сколько дней хранить бэкапы в data/backups/. Старее — чистятся после
 // каждого создания бэкапа + раз в интервал maintenance.
 const BACKUP_KEEP_DAYS = Number(process.env.BACKUP_KEEP_DAYS) || 30
+
+// Сколько дней хранить записи audit-лога. Старее — подрезаются в maintenance.
+// 90 дней покрывает квартальные ретроспективы и compliance-окно по умолчанию,
+// при этом не даёт массиву пухнуть на годы. Хард-кап AUDIT_HARD_CAP (10k записей,
+// в handlers.js) служит safety-сеткой для бурстов.
+const AUDIT_KEEP_DAYS = Number(process.env.AUDIT_KEEP_DAYS) || 90
 
 // Интервал фоновой maintenance-задачи: WAL auto-checkpoint + backup-prune.
 // Дёшево (две stat-операции), можно делать часто. 5 минут — компромисс
@@ -707,6 +713,19 @@ function maintenanceTick() {
   } catch (e) {
     console.error('[maintenance] session-cleanup failed:', e.message)
   }
+  // 4) Audit-ротация по возрасту. Хард-кап тикает at-insert (см. handlers.js),
+  // здесь подрезаем «старое». Если AUDIT_KEEP_DAYS=0 — выключено.
+  if (AUDIT_KEEP_DAYS > 0) {
+    try {
+      const n = cleanupAudit(AUDIT_KEEP_DAYS * 86400_000)
+      if (n > 0) {
+        console.log(`[maintenance] pruned ${n} audit record(s) older than ${AUDIT_KEEP_DAYS}d`)
+        scheduleSave()
+      }
+    } catch (e) {
+      console.error('[maintenance] audit-cleanup failed:', e.message)
+    }
+  }
 }
 
 // --- graceful shutdown -------------------------------------------------
@@ -760,5 +779,5 @@ httpServer = app.listen(PORT, HOST, () => {
   // exit'а, если кто-то прибил httpServer мимо shutdown'а.
   maintenanceTimer = setInterval(maintenanceTick, MAINTENANCE_INTERVAL_MS)
   maintenanceTimer.unref()
-  console.log(`[maintenance] enabled (interval=${Math.round(MAINTENANCE_INTERVAL_MS / 1000)}s, walThreshold=${WAL_AUTO_CHECKPOINT_MB}MB, backupKeep=${BACKUP_KEEP_DAYS}d)`)
+  console.log(`[maintenance] enabled (interval=${Math.round(MAINTENANCE_INTERVAL_MS / 1000)}s, walThreshold=${WAL_AUTO_CHECKPOINT_MB}MB, backupKeep=${BACKUP_KEEP_DAYS}d, auditKeep=${AUDIT_KEEP_DAYS}d)`)
 })

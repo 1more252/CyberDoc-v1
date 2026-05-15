@@ -1154,6 +1154,12 @@ function publicUser(u) {
   }
 }
 
+// Жёсткий потолок размера audit-лога. Срабатывает at insert time — гарантирует,
+// что даже без maintenance-tick'а лог не растёт за горизонт. Дополнительно
+// maintenance-tick подрезает по возрасту (см. cleanupAudit). 10k записей —
+// потолок «свежего», глубже хранится в файловых бэкапах.
+const AUDIT_HARD_CAP = 10_000
+
 function logAudit(actor, action, target, details = '', ip = '') {
   const entry = {
     id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -1168,8 +1174,28 @@ function logAudit(actor, action, target, details = '', ip = '') {
   // чтобы JSON-storage не пух от undefined.
   if (ip) entry.ip = ip
   db.audit.unshift(entry)
-  // Храним последние 5000 записей — ~1–2 дня горячего лога. Глубже — задача SIEM.
-  if (db.audit.length > 5000) db.audit.length = 5000
+  // Хард-кап: глубже задача SIEM / бэкапов. Возрастная ротация — в cleanupAudit.
+  if (db.audit.length > AUDIT_HARD_CAP) db.audit.length = AUDIT_HARD_CAP
+}
+
+// Подрезает audit по возрасту (старше maxAgeMs) и опциональному row-cap.
+// Возвращает кол-во удалённых записей. Вызывается из maintenance-tick'а.
+// Идемпотентна; для maxAgeMs <= 0 пропускает по возрасту (оставляет всё).
+export function cleanupAudit(maxAgeMs = 0, maxRows = AUDIT_HARD_CAP) {
+  if (!Array.isArray(db.audit) || db.audit.length === 0) return 0
+  const before = db.audit.length
+  let arr = db.audit
+  if (maxAgeMs > 0) {
+    const cutoff = Date.now() - maxAgeMs
+    arr = arr.filter((e) => (e?.at ?? 0) >= cutoff)
+  }
+  if (maxRows > 0 && arr.length > maxRows) {
+    // db.audit отсортирован новейшие→старейшие (unshift), берём префикс.
+    arr = arr.slice(0, maxRows)
+  }
+  if (arr.length === before) return 0
+  db.audit = arr
+  return before - arr.length
 }
 
 // Сравнивает before/after по списку полей и возвращает только изменения.

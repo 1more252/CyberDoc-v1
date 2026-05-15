@@ -230,6 +230,82 @@ const metrics = {
   totalLatencyMs: 0     // сумма для подсчёта среднего
 }
 
+// --- per-route latency tracking -----------------------------------------
+// Ring-buffer выборка latencies на ручку: O(1) запись, p50/p95/p99 за O(k log k)
+// при чтении (только в /metrics, не на горячем пути). k=200 — компромисс:
+// статистика стабильная, память ограничена (200 чисел × ~50 ручек × 8 байт ≈ 80KB).
+const LATENCY_SAMPLES = 200
+// Hard-cap на кол-во отслеживаемых ручек. Если кто-то начнёт фаззить URL'ы —
+// после порога новые route'ы складываются в спец-bucket 'other' вместо роста Map.
+const ROUTE_METRICS_MAX = 100
+const routeMetrics = new Map() // key → {count, totalMs, samples, idx, filled, slow}
+
+// Нормализатор пути в стабильный ключ: режем query, заменяем динамические сегменты
+// (числовые id, UUID, наши `audit-…`, `sess-…`, `org-…` etc.) на ':id', чтобы
+// /api/users/123 и /api/users/456 шли в одну bucket.
+const DYNAMIC_PREFIX_RE = /^(audit|sess|org|user|eq|doc|sw|st|threat|inn|psn|set)-/
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+function normalizeRouteKey(method, url) {
+  const q = url.indexOf('?')
+  const path = q >= 0 ? url.slice(0, q) : url
+  const segs = path.split('/').map((s) => {
+    if (!s) return s
+    if (/^\d+$/.test(s)) return ':id'
+    if (UUID_RE.test(s)) return ':id'
+    if (DYNAMIC_PREFIX_RE.test(s)) return ':id'
+    return s
+  })
+  return `${method} ${segs.join('/')}`
+}
+
+function recordRouteLatency(key, ms) {
+  let r = routeMetrics.get(key)
+  if (!r) {
+    if (routeMetrics.size >= ROUTE_METRICS_MAX) {
+      // Cap-busy: складываем в 'other', чтобы не плодить bucket'ы при фаззинге.
+      key = `${key.split(' ', 1)[0]} :other`
+      r = routeMetrics.get(key)
+    }
+    if (!r) {
+      r = { count: 0, totalMs: 0, samples: new Array(LATENCY_SAMPLES).fill(0), idx: 0, filled: 0, slow: 0 }
+      routeMetrics.set(key, r)
+    }
+  }
+  r.count++
+  r.totalMs += ms
+  if (ms > 500) r.slow++
+  r.samples[r.idx] = ms
+  r.idx = (r.idx + 1) % LATENCY_SAMPLES
+  if (r.filled < LATENCY_SAMPLES) r.filled++
+}
+
+// Sort + index — k log k, не вызывается в горячем пути.
+function routeQuantile(r, q) {
+  if (r.filled === 0) return 0
+  const sorted = r.samples.slice(0, r.filled).sort((a, b) => a - b)
+  return sorted[Math.min(r.filled - 1, Math.floor(r.filled * q))]
+}
+
+// Снапшот всех route'ов с агрегатами для /metrics. Возвращает массив
+// {route, count, meanMs, p50, p95, p99, slowCount}, отсортированный по count desc.
+function routeMetricsSnapshot() {
+  const out = []
+  for (const [key, r] of routeMetrics) {
+    out.push({
+      route: key,
+      count: r.count,
+      meanMs: r.count > 0 ? Math.round((r.totalMs / r.count) * 100) / 100 : 0,
+      p50: routeQuantile(r, 0.5),
+      p95: routeQuantile(r, 0.95),
+      p99: routeQuantile(r, 0.99),
+      slowCount: r.slow
+    })
+  }
+  out.sort((a, b) => b.count - a.count)
+  return out
+}
+
 function bumpUser(username, delta) {
   if (!username) return
   const cur = inflightByUser.get(username) || 0
@@ -277,6 +353,8 @@ app.use((req, res, next) => {
     if (metrics.byStatusClass[cls] !== undefined) metrics.byStatusClass[cls]++
     if (res.statusCode >= 500) metrics.errorResponses++
     metrics.byMethod[req.method] = (metrics.byMethod[req.method] || 0) + 1
+    // Per-route reservoir: O(1) запись, percentile-stats читаются только в /metrics.
+    recordRouteLatency(normalizeRouteKey(req.method, req.originalUrl), ms)
 
     // Логируем все 4xx/5xx + медленные (>100ms). 2xx быстрые — молчим.
     if (ms > 100 || res.statusCode >= 400) {
@@ -448,6 +526,28 @@ app.get('/metrics', (req, res) => {
     single('apn_error_responses_total', 'Responses with status >=500', 'counter', metrics.errorResponses)
     grouped('apn_requests_total', 'HTTP requests by status class', 'counter', metrics.byStatusClass, 'status')
     grouped('apn_requests_by_method_total', 'HTTP requests by method', 'counter', metrics.byMethod, 'method')
+
+    // Per-route метрики: top-50 по count (остальные глотает 'other' bucket).
+    // Экспортируем как пять gauges + один counter — не настоящий histogram
+    // (без cumulative buckets), но дёшево и читаемо в Prom-UI. Для полного
+    // histogram'а нужны pre-defined le-bucket'ы, что усложнит code и hot path.
+    const snap = routeMetricsSnapshot().slice(0, 50)
+    if (snap.length > 0) {
+      lines.push('# HELP apn_route_requests_total Per-route request count')
+      lines.push('# TYPE apn_route_requests_total counter')
+      for (const r of snap) lines.push(`apn_route_requests_total${fmtLabels({ route: r.route })} ${r.count}`)
+      lines.push('# HELP apn_route_latency_ms Per-route latency (ms), p50/p95/p99/mean')
+      lines.push('# TYPE apn_route_latency_ms gauge')
+      for (const r of snap) {
+        lines.push(`apn_route_latency_ms${fmtLabels({ route: r.route, quantile: '0.5' })} ${r.p50}`)
+        lines.push(`apn_route_latency_ms${fmtLabels({ route: r.route, quantile: '0.95' })} ${r.p95}`)
+        lines.push(`apn_route_latency_ms${fmtLabels({ route: r.route, quantile: '0.99' })} ${r.p99}`)
+        lines.push(`apn_route_latency_ms${fmtLabels({ route: r.route, quantile: 'mean' })} ${r.meanMs}`)
+      }
+      lines.push('# HELP apn_route_slow_total Per-route slow requests (>500ms)')
+      lines.push('# TYPE apn_route_slow_total counter')
+      for (const r of snap) lines.push(`apn_route_slow_total${fmtLabels({ route: r.route })} ${r.slowCount}`)
+    }
     res.type('text/plain; version=0.0.4; charset=utf-8').send(lines.join('\n') + '\n')
     return
   }
@@ -462,6 +562,10 @@ app.get('/metrics', (req, res) => {
     byStatusClass: metrics.byStatusClass,
     byMethod: metrics.byMethod,
     inflight: { current: inflight, peak: peakInflight },
+    // Top-50 ручек по count: route, p50/p95/p99, mean, slowCount. Достаточно
+    // для триажа «какая ручка тормозит» без отдельного APM. Сортировка
+    // на сервере, чтобы клиент не возился.
+    byRoute: routeMetricsSnapshot().slice(0, 50),
     readOnly: READ_ONLY
   })
 })

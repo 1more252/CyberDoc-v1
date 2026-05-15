@@ -91,6 +91,35 @@ export function _resetLoginFailures(username) {
   else loginFailures.clear()
 }
 
+// Сколько записей сейчас в lockout-map. Для /health/metrics — видеть рост.
+export function loginFailuresSize() {
+  return loginFailures.size
+}
+
+// Евиктит «протухшие» записи из loginFailures. Запись протухшая если:
+//   - lockout активен, но истёк (lockedUntil > 0 && lockedUntil <= now), ИЛИ
+//   - lockout не наступал, а failure-окно истекло
+//     (lockedUntil === 0 && now - firstFailAt > LOGIN_FAILURE_WINDOW_MS).
+// Активные lockout'ы (lockedUntil > now) и активные окна оставляем.
+//
+// Без этой функции Map рос монотонно: атакующий с rotation usernames
+// (admin1, admin2, ...) оставлял по записи на каждый и они никогда не
+// чистились (ленивая очистка в checkLockout срабатывает только при повторе
+// того же username). Maintenance-tick вызывает раз в 5 мин.
+export function cleanupLoginFailures() {
+  const now = Date.now()
+  let removed = 0
+  for (const [username, rec] of loginFailures) {
+    const lockoutExpired = rec.lockedUntil > 0 && rec.lockedUntil <= now
+    const windowExpired = rec.lockedUntil === 0 && (now - rec.firstFailAt) > LOGIN_FAILURE_WINDOW_MS
+    if (lockoutExpired || windowExpired) {
+      loginFailures.delete(username)
+      removed++
+    }
+  }
+  return removed
+}
+
 // === CREDENTIAL VALIDATION ==============================================
 // Пароль: min 8 символов, не только цифры (защита от 12345678), хотя бы
 // одна буква. Жёстко не требуем смешанный регистр / спец-символы — UX

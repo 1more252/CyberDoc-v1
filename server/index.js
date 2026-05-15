@@ -34,7 +34,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import { existsSync, statSync, mkdirSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher, cleanupExpiredSessions, cleanupAudit } from '../src/mock/handlers.js'
+import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher, cleanupExpiredSessions, cleanupAudit, cleanupLoginFailures, loginFailuresSize } from '../src/mock/handlers.js'
 import { makeAccessToken, makeRefreshToken } from './jwt.js'
 import { hash as pwHash, verify as pwVerify, isHashed as pwIsHashed } from './password.js'
 import {
@@ -355,6 +355,9 @@ app.get('/health', (_req, res) => {
       peak: peakInflight,
       uniqueUsers: inflightByUser.size
     },
+    // Размер lockout-map: важный signal под атакой. Норма <100, тысячи —
+    // повод смотреть rate-limit логи и blocking-rules перед сервером.
+    lockoutEntries: loginFailuresSize(),
     readOnly: READ_ONLY,
     shuttingDown
   })
@@ -725,6 +728,17 @@ function maintenanceTick() {
     } catch (e) {
       console.error('[maintenance] audit-cleanup failed:', e.message)
     }
+  }
+  // 5) Lockout-map cleanup: евиктим записи с истёкшим окном/локаутом.
+  // Без этого Map рос монотонно при атаке с rotation usernames.
+  // Чисто in-memory структура — scheduleSave() не нужен.
+  try {
+    const n = cleanupLoginFailures()
+    if (n > 0) {
+      console.log(`[maintenance] evicted ${n} stale lockout entr${n === 1 ? 'y' : 'ies'}`)
+    }
+  } catch (e) {
+    console.error('[maintenance] lockout-cleanup failed:', e.message)
   }
 }
 

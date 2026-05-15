@@ -301,35 +301,48 @@ app.use((req, res, next) => {
 // Дёшево (<1ms) — можно дёргать раз в секунду из uptime-чекера.
 
 const STARTED_AT = Date.now()
-// HEAD-варианты для LB-проб: load-balancer'у не нужно тело, ему достаточно
-// статус-кода. Без app.head() Express 404'ит HEAD-запросы на app.get()-роуты
-// (HEAD не матчится с GET-обработчиком). Делаем чтобы AWS ALB / k8s probe /
-// Pingdom могли использовать HEAD и экономить трафик.
+
+// Собирает stat по триаде sqlite-файлов (.db, .db-wal, .db-shm). В WAL-режиме
+// данные распределены между ними. Отсутствующий файл — норма (ещё не было ни
+// одного writer'а), молча пропускаем. Возвращает {db, '-wal', '-shm'} → {sizeBytes, mtime}.
+function statDbFiles() {
+  const dbPath = getDbPath()
+  const out = {}
+  for (const suffix of ['', '-wal', '-shm']) {
+    try {
+      const st = statSync(dbPath + suffix)
+      out[suffix || 'db'] = { sizeBytes: st.size, mtime: st.mtime }
+    } catch { /* нет файла */ }
+  }
+  return out
+}
+
+// Единое место правды для readiness-логики. И HEAD, и GET /ready ходят сюда,
+// чтобы не разъехались критерии готовности. `reason` нужен только GET'у —
+// HEAD отбрасывает его и шлёт пустое тело.
+function readinessState() {
+  if (shuttingDown) return { ok: false, reason: 'shutting_down' }
+  if (READ_ONLY) return { ok: false, reason: 'read_only' }
+  const users = countUsers()
+  if (users < 0) return { ok: false, reason: 'db_unavailable' }
+  if (users === 0) return { ok: false, reason: 'db_empty' }
+  return { ok: true }
+}
+
+// HEAD-варианты для LB-проб: load-balancer'у не нужно тело, достаточно
+// статус-кода. Без app.head() Express 404'ит HEAD-запросы на app.get()-роуты.
 app.head('/health', (_req, res) => res.status(200).end())
 app.head('/version', (_req, res) => res.status(200).end())
-app.head('/ready', (_req, res) => {
-  if (shuttingDown || READ_ONLY) return res.status(503).end()
-  const users = countUsers()
-  if (users <= 0) return res.status(503).end()
-  res.status(200).end()
-})
+app.head('/ready', (_req, res) => res.status(readinessState().ok ? 200 : 503).end())
 
 app.get('/health', (_req, res) => {
   const mem = process.memoryUsage()
-  // Суммируем app.db + -wal + -shm: в WAL-режиме реальные данные лежат
-  // в -wal до checkpoint'а, без суммы размер кажется аномально малым.
-  // -wal считаем отдельно, чтобы вынести в watch-метрику (раздутый -wal —
-  // частый источник «откуда место кончилось»).
-  const dbPath = getDbPath()
-  let dbSize = 0
-  let walSize = 0
-  for (const suffix of ['', '-wal', '-shm']) {
-    try {
-      const sz = statSync(dbPath + suffix).size
-      dbSize += sz
-      if (suffix === '-wal') walSize = sz
-    } catch { /* нет файла */ }
-  }
+  // app.db + -wal + -shm: в WAL-режиме реальные данные лежат в -wal до
+  // checkpoint'а, без суммы размер кажется аномально малым. -wal выносим
+  // отдельно (раздутый -wal — частый источник «откуда место кончилось»).
+  const files = statDbFiles()
+  const dbSize = (files.db?.sizeBytes ?? 0) + (files['-wal']?.sizeBytes ?? 0) + (files['-shm']?.sizeBytes ?? 0)
+  const walSize = files['-wal']?.sizeBytes ?? 0
   const walSizeMB = Math.round((walSize / 1024 / 1024) * 100) / 100
 
   res.json({
@@ -386,12 +399,8 @@ app.get('/version', (_req, res) => {
 // 200 — готов; 503 — нет (БД пуста / shutdown / read-only).
 
 app.get('/ready', (_req, res) => {
-  if (shuttingDown) return res.status(503).json({ ok: false, reason: 'shutting_down' })
-  if (READ_ONLY) return res.status(503).json({ ok: false, reason: 'read_only' })
-  const users = countUsers()
-  if (users < 0) return res.status(503).json({ ok: false, reason: 'db_unavailable' })
-  if (users === 0) return res.status(503).json({ ok: false, reason: 'db_empty' })
-  res.json({ ok: true })
+  const state = readinessState()
+  res.status(state.ok ? 200 : 503).json(state)
 })
 
 // --- /metrics (admin-only) ---------------------------------------------
@@ -564,7 +573,10 @@ app.post('/api/admin/backup', (req, res) => {
   const verify = verifyBackup(dest)
   // Сразу после успешного бэкапа подчищаем старые — чтобы место не копилось.
   const pruned = pruneOldBackups(BACKUP_DIR, BACKUP_KEEP_DAYS)
-  res.json({ ok: verify.ok, ...info, verify, pruned })
+  const payload = { ok: verify.ok, ...info, verify, pruned }
+  // Битый бэкап == провал операции, не «success с предупреждением». Возвращаем
+  // 500 чтобы alerting/CI заметили, payload оставляем (info+verify.error) для триажа.
+  res.status(verify.ok ? 200 : 500).json(payload)
 })
 
 // Per-table статистика для capacity-планирования: сколько rows + bytes
@@ -573,13 +585,11 @@ app.post('/api/admin/backup', (req, res) => {
 app.get('/api/admin/db-stats', (req, res) => {
   if (!requireAdmin(req, res)) return
   const tables = getTableStats()
-  const dbPath = getDbPath()
+  const rawFiles = statDbFiles()
+  // Для UI/JSON отдаём mtime в ISO — статичная сериализация Date нестабильна.
   const files = {}
-  for (const suffix of ['', '-wal', '-shm']) {
-    try {
-      const st = statSync(dbPath + suffix)
-      files[suffix || 'db'] = { sizeBytes: st.size, mtime: st.mtime.toISOString() }
-    } catch { /* нет файла — пропускаем */ }
+  for (const [k, v] of Object.entries(rawFiles)) {
+    files[k] = { sizeBytes: v.sizeBytes, mtime: v.mtime.toISOString() }
   }
   // Сумма по таблицам vs размер файла — расхождение = overhead страниц/индексов.
   let totalRows = 0

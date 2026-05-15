@@ -165,6 +165,56 @@ console.log(`[server] CORS: ${ALLOWED_ORIGINS.includes('*') ? 'open (*)' : 'allo
 if (READ_ONLY) console.warn('[server] READ_ONLY mode: mutations will return 503')
 // gzip всех ответов >1KB. JSON-ответы списков сжимаются в 4–10×.
 app.use(compression({ threshold: 1024 }))
+
+// --- per-route body-size guard ----------------------------------------
+// Глобальный 10MB-лимит express.json — потолок, но не дискриминирующий:
+// /auth/login физически не нуждается в 10MB body. Здесь — таблица
+// match-prefix → bytes. Срабатывает ДО json-parser'а: если клиент честно
+// прислал Content-Length и он превышает лимит, отбиваем 413 без буферизации
+// байтов. Если Content-Length нет/соврали — поймает express.json (его
+// лимит остаётся 10MB как defence-in-depth).
+//
+// Порядок имеет значение: первый матч по (method,prefix) выигрывает,
+// поэтому более специфичные prefixes — выше.
+const BODY_SIZE_LIMITS = [
+  { method: 'POST', prefix: '/api/auth/login', bytes: 4 * 1024 },
+  { method: 'POST', prefix: '/api/auth/register', bytes: 4 * 1024 },
+  { method: 'POST', prefix: '/api/auth/refresh', bytes: 1 * 1024 },
+  { method: 'POST', prefix: '/api/auth/logout', bytes: 1 * 1024 },
+  { method: 'POST', prefix: '/api/admin/change-password', bytes: 4 * 1024 },
+  // Bulk-upsert — единственная ручка, которая легитимно ест мегабайты.
+  // 10MB совпадает с глобальным express.json — больше не пустим вообще.
+  { method: 'POST', prefix: '/api/inn-registry/bulk-upsert', bytes: 10 * 1024 * 1024 }
+]
+// Default для всего остального POST/PUT/PATCH. 1MB покрывает запись оборудования
+// с длинным description без 10MB фуража для атак.
+const DEFAULT_BODY_LIMIT = Number(process.env.DEFAULT_BODY_LIMIT) || 1 * 1024 * 1024
+
+function bodyLimitFor(method, path) {
+  for (const e of BODY_SIZE_LIMITS) {
+    if (e.method === method && path.startsWith(e.prefix)) return e.bytes
+  }
+  return DEFAULT_BODY_LIMIT
+}
+
+const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH'])
+
+app.use((req, res, next) => {
+  if (!BODY_METHODS.has(req.method)) return next()
+  const cl = Number(req.headers['content-length'])
+  if (!Number.isFinite(cl) || cl <= 0) return next() // unknown → express.json дожмёт
+  const limit = bodyLimitFor(req.method, req.path)
+  if (cl > limit) {
+    return res.status(413).json({
+      error: 'payload_too_large',
+      message: `Тело запроса слишком большое (${cl} байт, лимит ${limit}).`,
+      limit,
+      got: cl
+    })
+  }
+  next()
+})
+
 app.use(express.json({ limit: '10mb' }))
 
 // --- field-length clamp ------------------------------------------------

@@ -34,7 +34,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import { existsSync, statSync, mkdirSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher, cleanupExpiredSessions, cleanupAudit, cleanupLoginFailures, loginFailuresSize } from '../src/mock/handlers.js'
+import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher, cleanupExpiredSessions, cleanupAudit, cleanupLoginFailures, loginFailuresSize, loginFailuresByIpSize } from '../src/mock/handlers.js'
 import { makeAccessToken, makeRefreshToken } from './jwt.js'
 import { hash as pwHash, verify as pwVerify, isHashed as pwIsHashed } from './password.js'
 import {
@@ -498,7 +498,9 @@ app.get('/health', (_req, res) => {
     },
     // Размер lockout-map: важный signal под атакой. Норма <100, тысячи —
     // повод смотреть rate-limit логи и blocking-rules перед сервером.
+    // Per-username и per-IP трекеры — разные сигнатуры атак (см. handlers.js).
     lockoutEntries: loginFailuresSize(),
+    lockoutIpEntries: loginFailuresByIpSize(),
     readOnly: READ_ONLY,
     shuttingDown
   })

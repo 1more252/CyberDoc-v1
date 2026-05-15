@@ -117,7 +117,79 @@ export function cleanupLoginFailures() {
       removed++
     }
   }
+  // Параллельный per-IP трекер (см. ниже): тот же протокол очистки.
+  for (const [ip, rec] of loginFailuresByIp) {
+    const lockoutExpired = rec.lockedUntil > 0 && rec.lockedUntil <= now
+    const windowExpired = rec.lockedUntil === 0 && (now - rec.firstFailAt) > LOGIN_IP_FAILURE_WINDOW_MS
+    if (lockoutExpired || windowExpired) {
+      loginFailuresByIp.delete(ip)
+      removed++
+    }
+  }
   return removed
+}
+
+// === PER-IP LOGIN LOCKOUT ==============================================
+// Per-username lockout закрывает «один логин, ботнет с разных IP» (=
+// classic credential stuffing). Симметричный сценарий — «один IP, перебор
+// разных username» (admin/root/user1/…) — обходит per-username threshold
+// (по 1 фейлу на юзера, до порога не доходим). Per-IP трекер закрывает
+// эту дыру.
+//
+// Параметры — выше per-username, потому что:
+//   - threshold=30: NAT с 50 юзерами легко набирает 5-10 опечаток в норме,
+//     30 уверенно сигналит «не human»;
+//   - window=10мин: атаки идут потоком, не редко-распределённо;
+//   - lockout=30мин: достаточный pain для атакующего, не катастрофа для NAT.
+//
+// Логика — параллельная: проверяется ОТДЕЛЬНО от per-username. Login проходит
+// только если оба чека пропустили (IP не локнут И username не локнут).
+const LOGIN_IP_FAILURE_THRESHOLD = Number(process.env.LOGIN_IP_FAILURE_THRESHOLD) || 30
+const LOGIN_IP_FAILURE_WINDOW_MS = Number(process.env.LOGIN_IP_FAILURE_WINDOW_MS) || 10 * 60_000
+const LOGIN_IP_LOCKOUT_MS = Number(process.env.LOGIN_IP_LOCKOUT_MS) || 30 * 60_000
+
+// Map<ip, { count, firstFailAt, lockedUntil }>
+const loginFailuresByIp = new Map()
+
+function checkIpLockout(ip) {
+  if (!ip) return 0
+  const rec = loginFailuresByIp.get(ip)
+  if (!rec) return 0
+  const now = Date.now()
+  if (rec.lockedUntil > now) return Math.ceil((rec.lockedUntil - now) / 1000)
+  if (rec.lockedUntil > 0 && rec.lockedUntil <= now) loginFailuresByIp.delete(ip)
+  return 0
+}
+
+function recordIpFailure(ip) {
+  if (!ip) return
+  const now = Date.now()
+  let rec = loginFailuresByIp.get(ip)
+  if (!rec || (now - rec.firstFailAt) > LOGIN_IP_FAILURE_WINDOW_MS) {
+    rec = { count: 0, firstFailAt: now, lockedUntil: 0 }
+    loginFailuresByIp.set(ip, rec)
+  }
+  rec.count++
+  if (rec.count >= LOGIN_IP_FAILURE_THRESHOLD) {
+    rec.lockedUntil = now + LOGIN_IP_LOCKOUT_MS
+  }
+}
+
+function clearIpFailures(ip) {
+  if (!ip) return
+  loginFailuresByIp.delete(ip)
+}
+
+// Размер per-IP map'а — отдельный сигнал в /health (рост = атака с
+// rotation usernames). Парный к loginFailuresSize().
+export function loginFailuresByIpSize() {
+  return loginFailuresByIp.size
+}
+
+// Test helper.
+export function _resetLoginFailuresByIp(ip) {
+  if (ip) loginFailuresByIp.delete(ip)
+  else loginFailuresByIp.clear()
 }
 
 // === CREDENTIAL VALIDATION ==============================================
@@ -417,8 +489,9 @@ async function loginHandler(body, headers) {
   const password = String(body?.password ?? '')
   const ip = String(headers?.['x-real-ip'] ?? '')
 
-  // 1. Лок-чек до обращения к БД и pwVerify (scrypt дорогой) — даже если
-  // юзер закидывает запросами, мы быстро отбиваемся.
+  // 1. Лок-чеки до обращения к БД и pwVerify (scrypt дорогой) — даже если
+  // юзер закидывает запросами, мы быстро отбиваемся. Чек ДВА: per-username
+  // (классический lockout) и per-IP (закрывает rotation usernames).
   const lockedFor = checkLockout(username)
   if (lockedFor > 0) {
     const minutes = Math.ceil(lockedFor / 60)
@@ -433,23 +506,39 @@ async function loginHandler(body, headers) {
       }
     }
   }
+  const ipLockedFor = checkIpLockout(ip)
+  if (ipLockedFor > 0) {
+    const minutes = Math.ceil(ipLockedFor / 60)
+    logAudit('(ip)', 'auth.login.locked_ip', ip, `lock ${minutes}мин`, ip)
+    return {
+      status: 429,
+      data: {
+        error: 'ip_locked',
+        message: `Слишком много неудачных попыток с этого IP. Подождите ${minutes} мин.`,
+        retryAfterSec: ipLockedFor
+      }
+    }
+  }
 
   const idx = db.users.findIndex((x) => x.username === username)
   if (idx < 0) {
     // Считаем фейл даже для несуществующих логинов — иначе атакующий
     // отличает «нет такого юзера» (без лимита) от «есть, но пароль не тот».
     recordLoginFailure(username)
+    recordIpFailure(ip)
     logAudit(username || '(anon)', 'auth.login.fail', username, 'unknown_user', ip)
     return { status: 401, data: { error: 'Неверный логин или пароль' } }
   }
   const u = db.users[idx]
   if (!(await pwVerify(password, u.password))) {
     recordLoginFailure(username)
+    recordIpFailure(ip)
     logAudit(username, 'auth.login.fail', username, 'wrong_password', ip)
     return { status: 401, data: { error: 'Неверный логин или пароль' } }
   }
-  // Успех — гасим счётчик, чтобы прошлые промахи не накапливались.
+  // Успех — гасим счётчики, чтобы прошлые промахи не накапливались.
   clearLoginFailures(username)
+  clearIpFailures(ip)
   // Ленивая миграция: первый успешный логин для legacy plain → пересохраняем hash.
   if (!pwIsHashed(u.password)) {
     db.users.splice(idx, 1, { ...u, password: await pwHash(password) })

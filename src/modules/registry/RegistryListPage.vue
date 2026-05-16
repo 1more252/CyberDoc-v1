@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useRegistryStore } from './registry.store.js'
 import { organizationApi } from '@/modules/organization/organization.api.js'
@@ -8,6 +8,7 @@ import { useToast } from '@/ui/useToast.js'
 import { useConfirm } from '@/ui/useConfirm.js'
 import { saveDocx } from '@/lib/docx-runner.js'
 import { formatDate } from '@/lib/format.js'
+import { useUrlFilterSync } from '@/lib/use-url-filters.js'
 import FlowNextStep from '@/ui/FlowNextStep.vue'
 
 const store = useRegistryStore()
@@ -130,9 +131,16 @@ async function loadOrgs() {
   }
 }
 
-onMounted(async () => {
-  await loadOrgs()
-  store.fetchList()
+useUrlFilterSync({
+  store,
+  fields: ['search', 'organizationId', 'status', 'mine', 'page'],
+  numericFields: ['page'],
+  booleanFields: ['mine'],
+  onReady: async () => {
+    searchInput.value = store.search
+    await loadOrgs()
+    store.fetchList()
+  }
 })
 
 const STATUS_OPTIONS = [

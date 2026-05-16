@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useDocumentSetStore } from './document-set.store.js'
 import { organizationApi } from '@/modules/organization/organization.api.js'
@@ -7,6 +7,7 @@ import { infoSystemsApi } from '@/modules/info-systems/info-systems.api.js'
 import { useToast } from '@/ui/useToast.js'
 import { useConfirm } from '@/ui/useConfirm.js'
 import { formatDate } from '@/lib/format.js'
+import { useUrlFilterSync } from '@/lib/use-url-filters.js'
 import FlowNextStep from '@/ui/FlowNextStep.vue'
 
 const store = useDocumentSetStore()
@@ -99,10 +100,15 @@ watch(
   }
 )
 
-onMounted(async () => {
-  await Promise.all([loadOrgs(), store.loadTemplates()])
-  await loadInfoSystems()
-  store.fetchList()
+useUrlFilterSync({
+  store,
+  fields: ['organizationId', 'infoSystemId', 'templateId', 'page'],
+  numericFields: ['page'],
+  onReady: async () => {
+    await Promise.all([loadOrgs(), store.loadTemplates()])
+    await loadInfoSystems()
+    store.fetchList()
+  }
 })
 </script>
 

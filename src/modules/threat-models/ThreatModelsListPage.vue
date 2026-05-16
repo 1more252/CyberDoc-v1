@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useThreatModelsStore } from './threat-models.store.js'
 import { organizationApi } from '@/modules/organization/organization.api.js'
@@ -7,6 +7,7 @@ import { infoSystemsApi } from '@/modules/info-systems/info-systems.api.js'
 import { useToast } from '@/ui/useToast.js'
 import { useConfirm } from '@/ui/useConfirm.js'
 import { formatDate } from '@/lib/format.js'
+import { useUrlFilterSync } from '@/lib/use-url-filters.js'
 import FlowNextStep from '@/ui/FlowNextStep.vue'
 
 const store = useThreatModelsStore()
@@ -98,10 +99,15 @@ watch(
   }
 )
 
-onMounted(async () => {
-  await loadOrgs()
-  await loadInfoSystems()
-  store.fetchList()
+useUrlFilterSync({
+  store,
+  fields: ['organizationId', 'infoSystemId', 'status', 'page'],
+  numericFields: ['page'],
+  onReady: async () => {
+    await loadOrgs()
+    await loadInfoSystems()
+    store.fetchList()
+  }
 })
 </script>
 

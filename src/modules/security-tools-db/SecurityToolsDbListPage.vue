@@ -1,11 +1,12 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useSecurityToolsDbStore } from './security-tools-db.store.js'
 import { useDictionariesStore } from '@/modules/dictionaries/dictionaries.store.js'
 import { useAuthStore } from '@/modules/auth/auth.store.js'
 import { useToast } from '@/ui/useToast.js'
 import { useConfirm } from '@/ui/useConfirm.js'
+import { useUrlFilterSync } from '@/lib/use-url-filters.js'
 import FlowNextStep from '@/ui/FlowNextStep.vue'
 
 const store = useSecurityToolsDbStore()
@@ -57,9 +58,15 @@ async function onDelete(c) {
   }
 }
 
-onMounted(async () => {
-  await dicts.load('typeSzi')
-  store.fetchList()
+useUrlFilterSync({
+  store,
+  fields: ['search', 'kindId', 'page'],
+  numericFields: ['page'],
+  onReady: async () => {
+    searchInput.value = store.search
+    await dicts.load('typeSzi')
+    store.fetchList()
+  }
 })
 </script>
 

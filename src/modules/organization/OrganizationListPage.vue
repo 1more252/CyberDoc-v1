@@ -1,10 +1,11 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useOrganizationStore } from './organization.store.js'
 import { useToast } from '@/ui/useToast.js'
 import { useConfirm } from '@/ui/useConfirm.js'
 import { formatDate } from '@/lib/format.js'
+import { useUrlFilterSync } from '@/lib/use-url-filters.js'
 import FlowNextStep from '@/ui/FlowNextStep.vue'
 
 const store = useOrganizationStore()
@@ -29,6 +30,16 @@ function gotoPage(p) {
   store.fetchList()
 }
 
+useUrlFilterSync({
+  store,
+  fields: ['search', 'page'],
+  numericFields: ['page'],
+  onReady: () => {
+    searchInput.value = store.search
+    store.fetchList()
+  }
+})
+
 async function onDelete(org) {
   const ok = await confirm.ask({
     title: 'Удалить организацию?',
@@ -45,9 +56,6 @@ async function onDelete(org) {
   }
 }
 
-onMounted(() => {
-  store.fetchList()
-})
 </script>
 
 <template>

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useEquipmentStore } from './equipment.store.js'
 import { organizationApi } from '@/modules/organization/organization.api.js'
@@ -8,6 +8,7 @@ import { useToast } from '@/ui/useToast.js'
 import { useConfirm } from '@/ui/useConfirm.js'
 import { saveDocx } from '@/lib/docx-runner.js'
 import { formatDate } from '@/lib/format.js'
+import { useUrlFilterSync } from '@/lib/use-url-filters.js'
 import FlowNextStep from '@/ui/FlowNextStep.vue'
 
 const store = useEquipmentStore()
@@ -154,10 +155,16 @@ async function loadInfoSystems() {
   }
 }
 
-onMounted(async () => {
-  await loadOrgs()
-  await loadInfoSystems()
-  store.fetchList()
+useUrlFilterSync({
+  store,
+  fields: ['search', 'organizationId', 'infoSystemId', 'status', 'page'],
+  numericFields: ['page'],
+  onReady: async () => {
+    searchInput.value = store.search
+    await loadOrgs()
+    await loadInfoSystems()
+    store.fetchList()
+  }
 })
 
 const STATUS_OPTIONS = [

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useSecurityToolsStore } from './security-tools.store.js'
 import { useDictionariesStore } from '@/modules/dictionaries/dictionaries.store.js'
@@ -8,6 +8,7 @@ import { infoSystemsApi } from '@/modules/info-systems/info-systems.api.js'
 import { useToast } from '@/ui/useToast.js'
 import { useConfirm } from '@/ui/useConfirm.js'
 import { formatDate } from '@/lib/format.js'
+import { useUrlFilterSync } from '@/lib/use-url-filters.js'
 import FlowNextStep from '@/ui/FlowNextStep.vue'
 
 const store = useSecurityToolsStore()
@@ -128,10 +129,16 @@ function expiryBadge(dateStr) {
   return { cls: 'text-bg-light', text: dateStr }
 }
 
-onMounted(async () => {
-  await Promise.all([loadOrgs(), dicts.load('typeSzi')])
-  await loadInfoSystems()
-  store.fetchList()
+useUrlFilterSync({
+  store,
+  fields: ['search', 'organizationId', 'infoSystemId', 'status', 'kindId', 'page'],
+  numericFields: ['page'],
+  onReady: async () => {
+    searchInput.value = store.search
+    await Promise.all([loadOrgs(), dicts.load('typeSzi')])
+    await loadInfoSystems()
+    store.fetchList()
+  }
 })
 </script>
 

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useInfoSystemsStore } from './info-systems.store.js'
 import { useDictionariesStore } from '@/modules/dictionaries/dictionaries.store.js'
@@ -7,6 +7,7 @@ import { organizationApi } from '@/modules/organization/organization.api.js'
 import { useToast } from '@/ui/useToast.js'
 import { useConfirm } from '@/ui/useConfirm.js'
 import { formatDate } from '@/lib/format.js'
+import { useUrlFilterSync } from '@/lib/use-url-filters.js'
 import FlowNextStep from '@/ui/FlowNextStep.vue'
 
 const store = useInfoSystemsStore()
@@ -95,9 +96,15 @@ function orgName(orgId) {
   return orgs.value.find((o) => o.id === orgId)?.name ?? '—'
 }
 
-onMounted(async () => {
-  await Promise.all([loadOrgs(), dicts.load('infoSysType')])
-  store.fetchList()
+useUrlFilterSync({
+  store,
+  fields: ['search', 'organizationId', 'typeId', 'status', 'page'],
+  numericFields: ['page'],
+  onReady: async () => {
+    searchInput.value = store.search
+    await Promise.all([loadOrgs(), dicts.load('infoSysType')])
+    store.fetchList()
+  }
 })
 </script>
 

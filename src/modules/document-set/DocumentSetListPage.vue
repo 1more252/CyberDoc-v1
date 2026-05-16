@@ -309,6 +309,7 @@ onMounted(async () => {
               <button
                 type="button"
                 class="btn btn-sm btn-outline-danger"
+                aria-label="Удалить"
                 @click="onDelete(d)"
               >
                 <i class="bi bi-trash" />

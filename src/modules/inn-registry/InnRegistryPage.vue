@@ -285,6 +285,7 @@ onMounted(() => {
               <button
                 type="button"
                 :class="['btn btn-sm btn-outline-danger']"
+                aria-label="Удалить"
                 @click="onRemoveOne(r.id)"
               >
                 <i class="bi bi-trash" />

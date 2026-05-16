@@ -333,6 +333,7 @@ const canEdit = (doc) => ['draft', 'rejected'].includes(doc.status) &&
                 v-if="canEdit(d)"
                 :class="['btn btn-sm btn-outline-secondary me-1']"
                 :to="`/dashboard/registry/${d.id}/edit`"
+                aria-label="Редактировать"
               >
                 <i class="bi bi-pencil" />
               </RouterLink>
@@ -340,6 +341,7 @@ const canEdit = (doc) => ['draft', 'rejected'].includes(doc.status) &&
                 v-if="canDelete(d)"
                 type="button"
                 :class="['btn btn-sm btn-outline-danger']"
+                aria-label="Удалить"
                 @click="onDelete(d)"
               >
                 <i class="bi bi-trash" />

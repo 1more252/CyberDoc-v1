@@ -600,6 +600,7 @@ onMounted(async () => {
                 type="button"
                 class="btn btn-sm btn-outline-secondary"
                 title="Убрать угрозу из модели"
+                aria-label="Убрать угрозу из модели"
                 @click="toggleThreat(t.catalog)"
               >
                 <i class="bi bi-x-lg" />

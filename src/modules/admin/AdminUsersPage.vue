@@ -287,6 +287,7 @@ onMounted(load)
                 :class="['btn btn-sm me-1', u.verified ? 'btn-outline-secondary' : 'btn-outline-success']"
                 :disabled="acting"
                 :title="u.verified ? 'Снять подтверждение' : 'Подтвердить'"
+                :aria-label="u.verified ? 'Снять подтверждение' : 'Подтвердить'"
                 @click="onVerify(u)"
               >
                 <i :class="['bi', u.verified ? 'bi-patch-check-fill' : 'bi-patch-check']" />
@@ -296,6 +297,7 @@ onMounted(load)
                 :class="['btn btn-sm me-1', u.blocked ? 'btn-outline-success' : 'btn-outline-warning']"
                 :disabled="isSelf(u) || acting"
                 :title="u.blocked ? 'Разблокировать' : 'Заблокировать'"
+                :aria-label="u.blocked ? 'Разблокировать' : 'Заблокировать'"
                 @click="onBlock(u)"
               >
                 <i :class="['bi', u.blocked ? 'bi-unlock' : 'bi-lock']" />
@@ -305,6 +307,7 @@ onMounted(load)
                 :class="['btn btn-sm btn-outline-secondary me-1']"
                 :disabled="acting"
                 title="Сменить пароль"
+                aria-label="Сменить пароль"
                 @click="onPassword(u)"
               >
                 <i class="bi bi-key" />
@@ -314,6 +317,7 @@ onMounted(load)
                 :class="['btn btn-sm btn-outline-danger']"
                 :disabled="isSelf(u) || acting"
                 title="Удалить"
+                aria-label="Удалить"
                 @click="onDelete(u)"
               >
                 <i class="bi bi-trash" />

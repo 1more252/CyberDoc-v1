@@ -248,12 +248,14 @@ onMounted(async () => {
               <RouterLink
                 class="btn btn-sm btn-outline-secondary me-1"
                 :to="`/dashboard/info-systems/${is.id}/edit`"
+                aria-label="Редактировать"
               >
                 <i class="bi bi-pencil" />
               </RouterLink>
               <button
                 type="button"
                 class="btn btn-sm btn-outline-danger"
+                aria-label="Удалить"
                 @click="onDelete(is)"
               >
                 <i class="bi bi-trash" />

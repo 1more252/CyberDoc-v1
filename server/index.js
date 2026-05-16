@@ -827,7 +827,6 @@ const adminLimiter = rateLimit({
 // положить пайплайн для остальных. 60/мин на write'ы — щедро для UI (десяток
 // форм), жёстко для скрипта-фаззера. Bulk-upsert вне счёта: он сам себе
 // ограничен (per-user inflight + body 10MB + chunk-cap 100).
-// skip-функция возвращает true для запросов, которые лимит должен ПРОПУСТИТЬ.
 const MUTATION_RATE_LIMIT = Number(process.env.MUTATION_RATE_LIMIT) || 60
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 const mutationLimiter = rateLimit({
@@ -860,8 +859,6 @@ app.use('/api', apiLimiter)
 // Чек после rate-limit (не тратим квоту на отбитые запросы) и до dispatcher'а
 // (не запускаем тяжёлую работу). Анон-запросы пропускаем.
 
-const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
-
 app.use('/api', (req, res, next) => {
   if (shuttingDown) {
     return res.status(503).json({ error: 'shutting_down', message: 'Сервер завершает работу.' })
@@ -869,7 +866,7 @@ app.use('/api', (req, res, next) => {
   // READ_ONLY: мутации → 503. Исключения: login/refresh/logout (нужны для
   // авторизации админа в режиме обслуживания) и /admin/* (это и есть инструменты
   // обслуживания). change-password остаётся заблокированным.
-  if (READ_ONLY && MUTATING.has(req.method)) {
+  if (READ_ONLY && MUTATING_METHODS.has(req.method)) {
     const path = req.path
     const exempt = path === '/auth/login' || path === '/auth/refresh' ||
                    path === '/auth/logout' || path.startsWith('/admin/')
@@ -1024,7 +1021,7 @@ app.all(/^\/api(\/.*)?$/, async (req, res) => {
       body: req.body,
       headers
     })
-    if (MUTATING.has(method) && result.status < 400) scheduleSave()
+    if (MUTATING_METHODS.has(method) && result.status < 400) scheduleSave()
 
     if (method === 'GET' && result.status === 200 && isEtagRoute(url)) {
       const body = JSON.stringify(result.data)

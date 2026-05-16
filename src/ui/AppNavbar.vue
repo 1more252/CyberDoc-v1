@@ -9,7 +9,10 @@ const router = useRouter()
 const dashboardLink = computed(() => {
   switch (auth.role) {
     case 'admin':
-      return { to: '/dashboard/admin', label: 'Админ-панель' }
+      // /dashboard/admin как entry-route не существует — у админа три раздела
+      // (users/audit/settings) без общего landing'а. Ведём на /users — тот же
+      // выбор делает LoginPage и HomePage для admin'а после логина.
+      return { to: '/dashboard/admin/users', label: 'Админ-панель' }
     case 'expert':
       return { to: '/dashboard/expert', label: 'Экспертная панель' }
     case 'user':

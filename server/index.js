@@ -1014,7 +1014,8 @@ app.post('/api/admin/maintenance', (req, res) => {
     maintenanceTick()
     res.json({ ok: true, ranAt: new Date().toISOString() })
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message })
+    console.error('[admin/maintenance]', e)
+    res.status(500).json({ ok: false, error: IS_PROD ? 'internal' : e.message })
   }
 })
 
@@ -1105,7 +1106,14 @@ app.all(/^\/api(\/.*)?$/, async (req, res) => {
       err: e?.message,
       stack: e?.stack
     }))
-    res.status(500).json({ error: 'internal', message: e?.message, reqId: req.reqId })
+    // В prod НЕ возвращаем e.message клиенту — может утечь SQL-детали,
+    // file paths, имена таблиц, accidental dumps. reqId — единственная
+    // нить для корреляции с server-логом.
+    res.status(500).json({
+      error: 'internal',
+      message: IS_PROD ? 'Внутренняя ошибка сервера.' : e?.message,
+      reqId: req.reqId
+    })
   }
 })
 

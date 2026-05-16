@@ -3,6 +3,7 @@ import * as defaultSigner from './jwt-sign.js'
 import * as defaultPassword from './password.js'
 import { fnsLookup } from './fns.js'
 import { parseJwt } from '../lib/jwt.js'
+import { isInnValid } from '../lib/inn-validate.js'
 
 const FNS_CHUNK_LIMIT = 50
 const INN_BULK_LIMIT = 100
@@ -294,6 +295,73 @@ function validateUsername(username) {
   if (!USERNAME_RE.test(username)) {
     return 'Логин: 3–32 латинских символа/цифры, можно ._-, начало — буква или цифра'
   }
+  return null
+}
+
+// === DATA VALIDATION (server-side, defense-in-depth) ====================
+// Фронт валидирует INN/OGRN/email до POST'а, но любой не-браузерный клиент
+// (curl, malicious uploader) может скормить мусор напрямую. Сервер — последняя
+// линия. Возвращает строку-ошибку или null. Пустая строка трактуется как
+// «поле не задано» (большинство полей опциональны, кроме name).
+
+// OGRN: 13 цифр (ЮЛ) или 15 (ИП). Контрольная цифра = (число без последней) mod
+// (10 для 13-знаков / 11 для 15-знаков), последний знак сравнивается.
+function isOgrnValid(ogrn) {
+  if (typeof ogrn !== 'string' || !/^\d+$/.test(ogrn)) return false
+  if (ogrn.length === 13) {
+    const main = ogrn.slice(0, 12)
+    const check = Number(ogrn[12])
+    return Number(BigInt(main) % 11n) % 10 === check
+  }
+  if (ogrn.length === 15) {
+    const main = ogrn.slice(0, 14)
+    const check = Number(ogrn[14])
+    return Number(BigInt(main) % 13n) % 10 === check
+  }
+  return false
+}
+
+// Намеренно простой regex (RFC 5322 целиком — overkill и плохо читается).
+// Покрывает 99% практики: один @, не-пустые местная и доменная части, точка
+// в домене, нет пробелов/кириллицы. Длина до 254 (RFC 5321 hard-limit).
+const EMAIL_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/
+function isEmailValid(email) {
+  return typeof email === 'string' && email.length <= 254 && EMAIL_RE.test(email)
+}
+
+// KPP: 9 цифр (для ЮЛ). У ИП нет КПП — пустое значение тоже валидно.
+function isKppValid(kpp) {
+  return typeof kpp === 'string' && /^\d{9}$/.test(kpp)
+}
+
+// Phone: разрешаем цифры, пробелы, скобки, дефисы, плюс. Минимум 6 цифр
+// (короче — мусор), максимум 32 символа (длиннее — мусор). Без жёсткой
+// нормализации — пользователь может писать +7 (495) 123-45-67 или 84951234567.
+function isPhoneValid(phone) {
+  if (typeof phone !== 'string') return false
+  if (phone.length > 32) return false
+  const digits = phone.replace(/\D/g, '')
+  return digits.length >= 6 && /^[\d\s()+-]+$/.test(phone)
+}
+
+// Валидация payload организации. Empty опциональные поля — OK; присутствие
+// требует валидного формата. name — обязателен (без него запись бессмысленна).
+// Возвращает строку-ошибку или null.
+export function validateOrgPayload(body) {
+  if (!body || typeof body !== 'object') return 'Некорректный запрос'
+  const name = typeof body.name === 'string' ? body.name.trim() : ''
+  if (!name) return 'Поле name обязательно'
+  if (name.length > 200) return 'Поле name слишком длинное (>200 символов)'
+  if (body.kind && body.kind !== 'ul' && body.kind !== 'ip') {
+    return 'Поле kind должно быть "ul" или "ip"'
+  }
+  if (body.inn && !isInnValid(String(body.inn))) return 'Некорректный ИНН'
+  if (body.ogrn && !isOgrnValid(String(body.ogrn))) return 'Некорректный ОГРН/ОГРНИП'
+  if (body.kpp && !isKppValid(String(body.kpp))) return 'Некорректный КПП (9 цифр)'
+  if (body.email && !isEmailValid(String(body.email))) return 'Некорректный email'
+  if (body.phone && !isPhoneValid(String(body.phone))) return 'Некорректный телефон'
+  if (body.address && String(body.address).length > 500) return 'Поле address слишком длинное'
+  if (body.notes && String(body.notes).length > 2000) return 'Поле notes слишком длинное'
   return null
 }
 
@@ -1010,6 +1078,8 @@ function orgGetHandler(id, caller) {
 function orgCreateHandler(body, caller) {
   if (!caller) return { status: 401, data: { error: 'no_token' } }
   if (caller.role === 'expert') return { status: 403, data: { error: 'forbidden' } }
+  const err = validateOrgPayload(body)
+  if (err) return { status: 422, data: { error: 'invalid_payload', message: err } }
   const now = Date.now()
   const o = {
     id: `org-${now}-${Math.random().toString(36).slice(2, 6)}`,
@@ -1038,6 +1108,22 @@ function orgUpdateHandler(id, body, caller) {
   const o = db.organizations[idx]
   if (caller.role === 'user' && o.ownerUsername !== caller.username)
     return { status: 403, data: { error: 'forbidden' } }
+  // На update проверяем «эффективный» payload (то, что реально запишем): для
+  // отсутствующих полей берём из текущей записи, чтобы PATCH-style не падал
+  // на name=undefined при частичном update'е.
+  const effective = {
+    kind: body?.kind ?? o.kind,
+    name: body?.name ?? o.name,
+    inn: body?.inn ?? o.inn,
+    ogrn: body?.ogrn ?? o.ogrn,
+    kpp: body?.kpp ?? o.kpp,
+    address: body?.address ?? o.address,
+    phone: body?.phone ?? o.phone,
+    email: body?.email ?? o.email,
+    notes: body?.notes ?? o.notes
+  }
+  const err = validateOrgPayload(effective)
+  if (err) return { status: 422, data: { error: 'invalid_payload', message: err } }
   const merged = {
     ...o,
     kind: body?.kind ?? o.kind,

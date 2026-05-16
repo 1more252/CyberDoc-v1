@@ -822,9 +822,38 @@ const adminLimiter = rateLimit({
   message: { error: 'admin_rate_limited', message: 'Слишком много admin-запросов. Притормозите.' }
 })
 
+// Per-IP лимит на mutating verbs (POST/PUT/PATCH/DELETE). apiLimiter общий
+// в 300/мин на всё включая read — один IP мог сжечь все 300 на write'ах и
+// положить пайплайн для остальных. 60/мин на write'ы — щедро для UI (десяток
+// форм), жёстко для скрипта-фаззера. Bulk-upsert вне счёта: он сам себе
+// ограничен (per-user inflight + body 10MB + chunk-cap 100).
+// skip-функция возвращает true для запросов, которые лимит должен ПРОПУСТИТЬ.
+const MUTATION_RATE_LIMIT = Number(process.env.MUTATION_RATE_LIMIT) || 60
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+const mutationLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: MUTATION_RATE_LIMIT,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'mutation_rate_limited', message: 'Слишком много изменяющих запросов с этого IP. Подождите минуту.' },
+  // Считаем только write'ы. GET/HEAD/OPTIONS — мимо. Login/register имеют
+  // свой loginLimiter (не считаем их дважды). Bulk-upsert карвим, его рулит
+  // inflight-квота + body-limit. Path читаем из originalUrl — после mount'а
+  // через app.use('/api', ...) req.path уже без префикса /api.
+  skip: (req) => {
+    if (!MUTATING_METHODS.has(req.method)) return true
+    const url = req.originalUrl || ''
+    if (url.startsWith('/api/auth/login')) return true
+    if (url.startsWith('/api/auth/register')) return true
+    if (url.startsWith('/api/inn-registry/bulk-upsert')) return true
+    return false
+  }
+})
+
 app.use('/api/auth/login', loginLimiter)
 app.use('/api/auth/register', loginLimiter)
 app.use('/api/admin', adminLimiter)
+app.use('/api', mutationLimiter)
 app.use('/api', apiLimiter)
 
 // --- per-user concurrent quota + shutdown guard ------------------------

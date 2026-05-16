@@ -14,6 +14,18 @@ export const db = ({
   // даёт SQLite-сохранение и список сессий юзера. Источник истины — массив:
   // при загрузке с диска Map восстанавливается из него.
   refreshTokenMeta: [],
+  // Replay-detection: использованные refresh-токены, чтобы поймать повторное
+  // предъявление украденного. Массив `[{token, username, usedAt}]` для SQLite;
+  // Map (см. handlers.js usedRefreshTokens) восстанавливается из него на load.
+  // Без персистентности — после рестарта вся история стирается, replay-window
+  // обнуляется → атакующий мог бы дождаться рестарта чтобы token прошёл как
+  // «новый» 401, без revoke-all-sessions.
+  replayHistoryMeta: [],
+  // Lockout-структуры (handlers.js loginFailures, loginFailuresByIp). Массивы
+  // `[{username|ip, count, firstFailAt, lockedUntil}]`. Без них лockout
+  // обнуляется при каждом restart'е — снижает эффективность брутфорс-защиты.
+  loginFailureMeta: [],
+  loginFailureByIpMeta: [],
   organizations: [],
   innRegistry: [],
 

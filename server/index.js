@@ -1057,7 +1057,10 @@ app.all(/^\/api(\/.*)?$/, async (req, res) => {
       body: req.body,
       headers
     })
-    if (MUTATING_METHODS.has(method) && result.status < 400) scheduleSave()
+    // dirty: handler сообщает «я тронул persisted-state, даже если ответ 4xx»
+    // (failed login → loginFailures, replay → usedRefreshTokens). Без этого
+    // 401/429-ответы не триггерили save и lockout не переживал рестарт.
+    if ((MUTATING_METHODS.has(method) && result.status < 400) || result.dirty) scheduleSave()
 
     if (method === 'GET' && result.status === 200 && isEtagRoute(url)) {
       const body = JSON.stringify(result.data)

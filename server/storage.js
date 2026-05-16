@@ -19,6 +19,7 @@ import { mkdirSync, existsSync, statSync, unlinkSync, readFileSync, readdirSync 
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { db } from '../src/mock/db.js'
+import { _rehydrateSecurityState } from '../src/mock/handlers.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = resolve(HERE, '..', 'data')
@@ -39,7 +40,14 @@ const SAVE_KEYS = [
   'documentSets',
   'documents',
   'audit',
-  'refreshTokenMeta'
+  'refreshTokenMeta',
+  // Security-state mirrors (handlers.js mirrorReplayHistory /
+  // mirrorLoginFailures / mirrorIpFailures): replay-history и lockout
+  // должны пережить рестарт, иначе атакующий получает бесплатный reset
+  // защит на каждом deploy/crash.
+  'replayHistoryMeta',
+  'loginFailureMeta',
+  'loginFailureByIpMeta'
 ]
 
 mkdirSync(DATA_DIR, { recursive: true })
@@ -69,6 +77,10 @@ export async function loadFromDisk() {
   if (Array.isArray(db.refreshTokenMeta)) {
     db.refreshTokens = new Map(db.refreshTokenMeta.map((s) => [s.token, s.username]))
   }
+  // loginFailures / loginFailuresByIp / usedRefreshTokens — модульные Map'ы
+  // внутри handlers.js, недоступные снаружи. Перестраиваем через экспортированный
+  // хелпер; он clear()'ит существующие Map'ы и наполняет из db.*Meta.
+  _rehydrateSecurityState()
   return any
 }
 

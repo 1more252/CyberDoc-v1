@@ -67,6 +67,14 @@ const LOGIN_FAILURE_WINDOW_MS = Number(process.env.LOGIN_FAILURE_WINDOW_MS) || 1
 // Map<username, { count, firstFailAt, lockedUntil }>
 const loginFailures = new Map()
 
+// Зеркалируем Map → db.loginFailureMeta после каждой мутации, чтобы запись
+// попала в SQLite через общий save-pipeline. Стоимость O(n), n обычно <100
+// (даже под атакой, т.к. cleanupLoginFailures чистит протухшие). Map
+// остаётся источником истины для O(1) lookup; массив — для персистентности.
+function mirrorLoginFailures() {
+  db.loginFailureMeta = Array.from(loginFailures.entries()).map(([username, rec]) => ({ username, ...rec }))
+}
+
 function checkLockout(username) {
   const rec = loginFailures.get(username)
   if (!rec) return 0
@@ -75,6 +83,7 @@ function checkLockout(username) {
   if (rec.lockedUntil > 0 && rec.lockedUntil <= now) {
     // Lockout истёк — стираем запись, следующая ошибка начнёт окно заново.
     loginFailures.delete(username)
+    mirrorLoginFailures()
   }
   return 0
 }
@@ -90,10 +99,12 @@ function recordLoginFailure(username) {
   if (rec.count >= LOGIN_FAILURE_LIMIT) {
     rec.lockedUntil = now + LOGIN_LOCKOUT_MS
   }
+  mirrorLoginFailures()
 }
 
 function clearLoginFailures(username) {
   loginFailures.delete(username)
+  mirrorLoginFailures()
 }
 
 // Test/admin helper: позволяет вручную сбросить локаут (для тестов и
@@ -101,6 +112,7 @@ function clearLoginFailures(username) {
 export function _resetLoginFailures(username) {
   if (username) loginFailures.delete(username)
   else loginFailures.clear()
+  mirrorLoginFailures()
 }
 
 // Сколько записей сейчас в lockout-map. Для /health/metrics — видеть рост.
@@ -121,12 +133,15 @@ export function loginFailuresSize() {
 export function cleanupLoginFailures() {
   const now = Date.now()
   let removed = 0
+  let mutatedUser = false
+  let mutatedIp = false
   for (const [username, rec] of loginFailures) {
     const lockoutExpired = rec.lockedUntil > 0 && rec.lockedUntil <= now
     const windowExpired = rec.lockedUntil === 0 && (now - rec.firstFailAt) > LOGIN_FAILURE_WINDOW_MS
     if (lockoutExpired || windowExpired) {
       loginFailures.delete(username)
       removed++
+      mutatedUser = true
     }
   }
   // Параллельный per-IP трекер (см. ниже): тот же протокол очистки.
@@ -136,8 +151,13 @@ export function cleanupLoginFailures() {
     if (lockoutExpired || windowExpired) {
       loginFailuresByIp.delete(ip)
       removed++
+      mutatedIp = true
     }
   }
+  // Mirror только если действительно что-то меняли — иначе впустую перебираем
+  // Map в Array.from на каждый maintenance-tick.
+  if (mutatedUser) mirrorLoginFailures()
+  if (mutatedIp) mirrorIpFailures()
   return removed
 }
 
@@ -163,13 +183,21 @@ const LOGIN_IP_LOCKOUT_MS = Number(process.env.LOGIN_IP_LOCKOUT_MS) || 30 * 60_0
 // Map<ip, { count, firstFailAt, lockedUntil }>
 const loginFailuresByIp = new Map()
 
+// Парный mirror для per-IP трекера. Симметричен mirrorLoginFailures.
+function mirrorIpFailures() {
+  db.loginFailureByIpMeta = Array.from(loginFailuresByIp.entries()).map(([ip, rec]) => ({ ip, ...rec }))
+}
+
 function checkIpLockout(ip) {
   if (!ip) return 0
   const rec = loginFailuresByIp.get(ip)
   if (!rec) return 0
   const now = Date.now()
   if (rec.lockedUntil > now) return Math.ceil((rec.lockedUntil - now) / 1000)
-  if (rec.lockedUntil > 0 && rec.lockedUntil <= now) loginFailuresByIp.delete(ip)
+  if (rec.lockedUntil > 0 && rec.lockedUntil <= now) {
+    loginFailuresByIp.delete(ip)
+    mirrorIpFailures()
+  }
   return 0
 }
 
@@ -185,11 +213,13 @@ function recordIpFailure(ip) {
   if (rec.count >= LOGIN_IP_FAILURE_THRESHOLD) {
     rec.lockedUntil = now + LOGIN_IP_LOCKOUT_MS
   }
+  mirrorIpFailures()
 }
 
 function clearIpFailures(ip) {
   if (!ip) return
   loginFailuresByIp.delete(ip)
+  mirrorIpFailures()
 }
 
 // Размер per-IP map'а — отдельный сигнал в /health (рост = атака с
@@ -202,6 +232,34 @@ export function loginFailuresByIpSize() {
 export function _resetLoginFailuresByIp(ip) {
   if (ip) loginFailuresByIp.delete(ip)
   else loginFailuresByIp.clear()
+}
+
+// Восстанавливает Map'ы lockout/replay-history из db.*Meta после загрузки
+// из SQLite. Вызывается из server/storage.js один раз после loadFromDisk.
+// Без этого после рестарта Map'ы пустые → активные lockout'ы и replay-history
+// «забываются» (атакующий получает бесплатный reset на каждом рестарте).
+export function _rehydrateSecurityState() {
+  loginFailures.clear()
+  if (Array.isArray(db.loginFailureMeta)) {
+    for (const rec of db.loginFailureMeta) {
+      const { username, ...rest } = rec
+      if (username) loginFailures.set(username, rest)
+    }
+  }
+  loginFailuresByIp.clear()
+  if (Array.isArray(db.loginFailureByIpMeta)) {
+    for (const rec of db.loginFailureByIpMeta) {
+      const { ip, ...rest } = rec
+      if (ip) loginFailuresByIp.set(ip, rest)
+    }
+  }
+  usedRefreshTokens.clear()
+  if (Array.isArray(db.replayHistoryMeta)) {
+    for (const rec of db.replayHistoryMeta) {
+      const { token, ...rest } = rec
+      if (token) usedRefreshTokens.set(token, rest)
+    }
+  }
 }
 
 // === CREDENTIAL VALIDATION ==============================================
@@ -539,14 +597,14 @@ async function loginHandler(body, headers) {
     recordLoginFailure(username)
     recordIpFailure(ip)
     logAudit(username || '(anon)', 'auth.login.fail', username, 'unknown_user', ip)
-    return { status: 401, data: { error: 'Неверный логин или пароль' } }
+    return { status: 401, dirty: true, data: { error: 'Неверный логин или пароль' } }
   }
   const u = db.users[idx]
   if (!(await pwVerify(password, u.password))) {
     recordLoginFailure(username)
     recordIpFailure(ip)
     logAudit(username, 'auth.login.fail', username, 'wrong_password', ip)
-    return { status: 401, data: { error: 'Неверный логин или пароль' } }
+    return { status: 401, dirty: true, data: { error: 'Неверный логин или пароль' } }
   }
   // Успех — гасим счётчики, чтобы прошлые промахи не накапливались.
   clearLoginFailures(username)
@@ -610,9 +668,10 @@ function refreshHandler(body, headers) {
       // Помечаем все остальные refresh-токены этого юзера тоже как «used» —
       // иначе атакующий подберёт следующий refresh из перехваченной партии.
       usedRefreshTokens.delete(presented) // конкретно этот уже отработал
+      mirrorReplayHistory()
       logAudit(replayed.username, 'auth.refresh_replay', `user:${replayed.username}`,
         'all_sessions_revoked', ip)
-      return { status: 401, data: { error: 'token_replayed', message: 'Подозрение на компрометацию токена. Все сессии отозваны, войдите заново.' } }
+      return { status: 401, dirty: true, data: { error: 'token_replayed', message: 'Подозрение на компрометацию токена. Все сессии отозваны, войдите заново.' } }
     }
     return { status: 401, data: { error: 'invalid_refresh' } }
   }
@@ -670,6 +729,13 @@ const REPLAY_HISTORY_TTL_MS = Number(process.env.REPLAY_HISTORY_TTL_MS) || 7 * 8
 const REPLAY_HISTORY_MAX = Number(process.env.REPLAY_HISTORY_MAX) || 5000
 const usedRefreshTokens = new Map()
 
+// Mirror для replay-history. Без него после рестарта Map пустеет → украденный
+// токен будет «никогда не существовал» (просто 401), а не «использован → revoke
+// all sessions». Phase 16 без персистентности был частично декорацией.
+function mirrorReplayHistory() {
+  db.replayHistoryMeta = Array.from(usedRefreshTokens.entries()).map(([token, meta]) => ({ token, ...meta }))
+}
+
 // Метрики rotation/replay. Экспортируются через export'ы ниже, в /metrics
 // собирает server/index.js. Сбрасываются при рестарте — для накопления
 // нужен внешний exporter (TODO Phase: structured logs/pino).
@@ -688,6 +754,7 @@ function markRefreshUsed(token, username) {
     if (firstKey) usedRefreshTokens.delete(firstKey)
   }
   usedRefreshTokens.set(token, { username, usedAt: Date.now() })
+  mirrorReplayHistory()
 }
 
 // Чистим протухшие записи из replay-истории. Вызывается из cleanupExpiredSessions
@@ -701,6 +768,7 @@ function cleanupReplayHistory() {
       removed++
     }
   }
+  if (removed > 0) mirrorReplayHistory()
   return removed
 }
 

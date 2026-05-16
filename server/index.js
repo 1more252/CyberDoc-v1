@@ -67,6 +67,13 @@ const TRUST_PROXY = process.env.TRUST_PROXY === 'true'
 // мешает. Анон-запросы ограничивает общий rate-limit.
 const PER_USER_INFLIGHT_LIMIT = Number(process.env.PER_USER_INFLIGHT_LIMIT) || 20
 
+// Парный лимит — concurrent inflight на IP. rateLimit считает req/min,
+// а это — сколько одновременных connection'ов держит один IP. Закрывает
+// slow-loris / login-flood (200 параллельных scrypt'ов с одного хоста)
+// и анонимный трафик в целом (per-user не сработает без токена).
+// 50 — щедро для NAT (CGNAT, корп.офис), жёстко для атакующего бота.
+const PER_IP_INFLIGHT_LIMIT = Number(process.env.PER_IP_INFLIGHT_LIMIT) || 50
+
 // Сколько ждать дренажа inflight перед shutdown'ом.
 const SHUTDOWN_DRAIN_MS = Number(process.env.SHUTDOWN_DRAIN_MS) || 5000
 
@@ -116,7 +123,9 @@ const MAX_FIELD_DEPTH = 16
 
 // --- bootstrap -----------------------------------------------------------
 
-setMockDelayMs(0)
+// MOCK_DELAY_MS=200 — искусственная задержка на каждый dispatcher-вызов.
+// Используется в load-/смок-тестах, в проде должен быть 0 (default).
+setMockDelayMs(Number(process.env.MOCK_DELAY_MS) || 0)
 setTokenSigner({ makeAccessToken, makeRefreshToken })
 setPasswordHasher({ hash: pwHash, verify: pwVerify, isHashed: pwIsHashed })
 
@@ -265,6 +274,9 @@ app.use((req, _res, next) => {
 let inflight = 0
 let peakInflight = 0
 const inflightByUser = new Map()
+// Парная структура: concurrent count per IP. Анон-запросы и неавторизованные
+// (login-flood, slow-POST) ограничиваются именно здесь.
+const inflightByIp = new Map()
 
 // --- метрики ------------------------------------------------------------
 // Лёгкие in-memory счётчики; не Prometheus-grade, но даёт картину тренда
@@ -364,6 +376,16 @@ function bumpUser(username, delta) {
   else inflightByUser.set(username, next)
 }
 
+// Парная функция к bumpUser — общий контракт для двух Map'ов: при <=0
+// удаляем ключ, чтобы Map не пух «нулями» после завершившихся IP.
+function bumpIp(ip, delta) {
+  if (!ip) return
+  const cur = inflightByIp.get(ip) || 0
+  const next = cur + delta
+  if (next <= 0) inflightByIp.delete(ip)
+  else inflightByIp.set(ip, next)
+}
+
 // Достаём username из Bearer-токена без валидации подписи — это для квоты,
 // авторизацию делает handlers.js. Битый/просроченный токен → не учитываем.
 function callerName(req) {
@@ -384,6 +406,9 @@ app.use((req, res, next) => {
   const user = callerName(req)
   req._user = user
   bumpUser(user, +1)
+  const ip = req.ip
+  req._ip = ip
+  bumpIp(ip, +1)
 
   let released = false
   const release = () => {
@@ -391,6 +416,7 @@ app.use((req, res, next) => {
     released = true
     inflight--
     bumpUser(user, -1)
+    bumpIp(ip, -1)
   }
   res.on('close', release)
   res.on('finish', () => {
@@ -494,7 +520,8 @@ app.get('/health', (_req, res) => {
     inflight: {
       total: inflight,
       peak: peakInflight,
-      uniqueUsers: inflightByUser.size
+      uniqueUsers: inflightByUser.size,
+      uniqueIps: inflightByIp.size
     },
     // Размер lockout-map: важный signal под атакой. Норма <100, тысячи —
     // повод смотреть rate-limit логи и blocking-rules перед сервером.
@@ -572,6 +599,7 @@ app.get('/metrics', (req, res) => {
     single('apn_inflight_current', 'Current inflight requests', 'gauge', inflight)
     single('apn_inflight_peak', 'Peak inflight requests since start', 'gauge', peakInflight)
     single('apn_inflight_users', 'Distinct authenticated users with inflight requests', 'gauge', inflightByUser.size)
+    single('apn_inflight_ips', 'Distinct IPs with inflight requests', 'gauge', inflightByIp.size)
     single('apn_read_only', 'Whether READ_ONLY mode is on (1/0)', 'gauge', READ_ONLY ? 1 : 0)
     single('apn_mean_latency_ms', 'Mean response latency (ms) since start', 'gauge', meanLatency)
     single('apn_slow_requests_total', 'Requests slower than 500ms', 'counter', metrics.slowRequests)
@@ -613,7 +641,7 @@ app.get('/metrics', (req, res) => {
     errorResponses: metrics.errorResponses,
     byStatusClass: metrics.byStatusClass,
     byMethod: metrics.byMethod,
-    inflight: { current: inflight, peak: peakInflight },
+    inflight: { current: inflight, peak: peakInflight, uniqueUsers: inflightByUser.size, uniqueIps: inflightByIp.size },
     // Top-50 ручек по count: route, p50/p95/p99, mean, slowCount. Достаточно
     // для триажа «какая ручка тормозит» без отдельного APM. Сортировка
     // на сервере, чтобы клиент не возился.
@@ -677,6 +705,19 @@ app.use('/api', (req, res, next) => {
                    path === '/auth/logout' || path.startsWith('/admin/')
     if (!exempt) {
       return res.status(503).json({ error: 'read_only', message: 'Сервер в режиме read-only.' })
+    }
+  }
+  // Per-IP concurrent guard работает до per-user: ловим slow-loris / login-flood
+  // на анонимном этапе. Сам запрос УЖЕ в счётчике (bumpIp(+1) в общем middleware),
+  // поэтому сравниваем с > limit.
+  const ip = req._ip
+  if (ip) {
+    const ipCur = inflightByIp.get(ip) || 0
+    if (ipCur > PER_IP_INFLIGHT_LIMIT) {
+      return res.status(429).json({
+        error: 'ip_quota_exceeded',
+        message: `Слишком много одновременных запросов с этого IP (>${PER_IP_INFLIGHT_LIMIT}). Подождите.`
+      })
     }
   }
   const user = req._user

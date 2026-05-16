@@ -9,6 +9,7 @@
 // ===========================================================================
 
 import { createHmac, randomBytes } from 'node:crypto'
+import { jwtLog } from './logger.js'
 
 const SECRET =
   process.env.JWT_SECRET ||
@@ -19,7 +20,7 @@ const SECRET =
     : randomBytes(32).toString('hex'))
 
 if (!process.env.JWT_SECRET) {
-  console.warn('[jwt] JWT_SECRET not set — using random secret (dev only)')
+  jwtLog.warn('JWT_SECRET not set — using random secret (dev only)')
 }
 
 function b64url(buf) {

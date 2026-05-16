@@ -20,6 +20,7 @@ import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { db } from '../src/mock/db.js'
 import { _rehydrateSecurityState } from '../src/mock/handlers.js'
+import { storageLog } from './logger.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = resolve(HERE, '..', 'data')
@@ -139,7 +140,7 @@ function flushNow() {
       writeTable(key)
       checksums.set(key, cs)
     } catch (e) {
-      console.error(`[storage] write ${key} failed:`, e.message)
+      storageLog.error({ err: e, key }, 'write table failed')
     }
   }
 }
@@ -321,10 +322,10 @@ export function importLegacyJsonIfEmpty() {
       if (Array.isArray(parsed[key])) db[key] = parsed[key]
     }
     flushNow()
-    console.log('[storage] imported legacy db.json into app.db')
+    storageLog.info('imported legacy db.json into app.db')
     return true
   } catch (e) {
-    console.error('[storage] legacy import failed:', e.message)
+    storageLog.error({ err: e }, 'legacy import failed')
     return false
   }
 }

@@ -54,6 +54,7 @@ import {
   pingDb
 } from './storage.js'
 import { verifyJwt } from './jwt.js'
+import { logger, serverLog, maintLog } from './logger.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const DIST_DIR = resolve(HERE, '..', 'dist')
@@ -174,7 +175,7 @@ setPasswordHasher({ hash: pwHash, verify: pwVerify, isHashed: pwIsHashed })
 
 importLegacyJsonIfEmpty()
 const loaded = await loadFromDisk()
-console.log(loaded ? '[server] loaded data from app.db' : '[server] cold start (empty db)')
+serverLog.info(loaded ? 'loaded data from app.db' : 'cold start (empty db)')
 
 const app = express()
 if (TRUST_PROXY) app.set('trust proxy', 1)
@@ -213,8 +214,8 @@ const corsOptions = {
       })
 }
 app.use(cors(corsOptions))
-console.log(`[server] CORS: ${ALLOWED_ORIGINS.includes('*') ? 'open (*)' : 'allowlist=' + ALLOWED_ORIGINS.join(',')}`)
-if (READ_ONLY) console.warn('[server] READ_ONLY mode: mutations will return 503')
+serverLog.info({ cors: ALLOWED_ORIGINS.includes('*') ? 'open' : 'allowlist', origins: ALLOWED_ORIGINS }, 'CORS configured')
+if (READ_ONLY) serverLog.warn('READ_ONLY mode: mutations will return 503')
 // gzip всех ответов >1KB. JSON-ответы списков сжимаются в 4–10×.
 app.use(compression({ threshold: 1024 }))
 
@@ -247,6 +248,14 @@ function bodyLimitFor(method, path) {
     if (e.method === method && path.startsWith(e.prefix)) return e.bytes
   }
   return DEFAULT_BODY_LIMIT
+}
+
+// Округление bytes → MB с заданной точностью. Возвращает Number, чтобы и в
+// JSON-ответе /health, и в structured-логе maintenance, поле было числовым
+// (а не string из toFixed).
+function bytesToMB(bytes, decimals = 1) {
+  const f = 10 ** decimals
+  return Math.round(((bytes ?? 0) / 1024 / 1024) * f) / f
 }
 
 const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH'])
@@ -472,7 +481,7 @@ function recordRouteLatency(key, ms) {
         const now = Date.now()
         if (!r.lastAlertAt || now - r.lastAlertAt > SLOW_BURN_ALERT_THROTTLE_MS) {
           const ratio = r.baselineP95 > 0 ? (cur / r.baselineP95).toFixed(1) : '∞'
-          console.warn(`[slow-burn] ${key} p95=${cur}ms baseline=${r.baselineP95}ms (×${ratio}, samples=${r.count})`)
+          serverLog.warn({ slowBurn: true, route: key, p95: cur, baseline: r.baselineP95, ratio, samples: r.count }, 'route p95 regressed')
           r.lastAlertAt = now
         }
       }
@@ -579,17 +588,17 @@ app.use((req, res, next) => {
 
     // Логируем все 4xx/5xx + медленные (>100ms). 2xx быстрые — молчим.
     if (ms > 100 || res.statusCode >= 400) {
-      const line = {
-        t: new Date().toISOString(),
-        id: reqId,
-        m: req.method,
-        u: req.originalUrl,
-        s: res.statusCode,
+      const payload = {
+        reqId,
+        method: req.method,
+        url: req.originalUrl,
+        status: res.statusCode,
         ms,
         ip: req.ip
       }
-      const stream = res.statusCode >= 500 ? console.error : console.log
-      stream(JSON.stringify(line))
+      if (res.statusCode >= 500) logger.error(payload, 'req')
+      else if (res.statusCode >= 400) logger.warn(payload, 'req')
+      else logger.info(payload, 'req')
     }
   })
   next()
@@ -649,7 +658,7 @@ app.get('/health', (req, res) => {
   const files = statDbFiles()
   const dbSize = (files.db?.sizeBytes ?? 0) + (files['-wal']?.sizeBytes ?? 0) + (files['-shm']?.sizeBytes ?? 0)
   const walSize = files['-wal']?.sizeBytes ?? 0
-  const walSizeMB = Math.round((walSize / 1024 / 1024) * 100) / 100
+  const walSizeMB = bytesToMB(walSize, 2)
 
   // Deep-probe сделал select 1 — если упал, /health тоже должен сигналить
   // не-200, иначе LB будет держать pod в ротации с битой БД.
@@ -663,16 +672,16 @@ app.get('/health', (req, res) => {
     db: {
       users: countUsers(),
       pendingWrites: hasPendingWrites(),
-      sizeMB: Math.round((dbSize / 1024 / 1024) * 100) / 100,
+      sizeMB: bytesToMB(dbSize, 2),
       walSizeMB,
       walAlert: walSizeMB > WAL_ALERT_MB,
       // dbProbe — undefined в обычном режиме, объект {ok, latencyMs, ...} в deep
       probe: dbProbe || undefined
     },
     mem: {
-      rssMB: Math.round((mem.rss / 1024 / 1024) * 100) / 100,
-      heapUsedMB: Math.round((mem.heapUsed / 1024 / 1024) * 100) / 100,
-      heapTotalMB: Math.round((mem.heapTotal / 1024 / 1024) * 100) / 100
+      rssMB: bytesToMB(mem.rss, 2),
+      heapUsedMB: bytesToMB(mem.heapUsed, 2),
+      heapTotalMB: bytesToMB(mem.heapTotal, 2)
     },
     inflight: {
       total: inflight,
@@ -1014,7 +1023,7 @@ app.post('/api/admin/maintenance', (req, res) => {
     maintenanceTick()
     res.json({ ok: true, ranAt: new Date().toISOString() })
   } catch (e) {
-    console.error('[admin/maintenance]', e)
+    serverLog.error({ err: e }, 'admin/maintenance failed')
     res.status(500).json({ ok: false, error: IS_PROD ? 'internal' : e.message })
   }
 })
@@ -1097,15 +1106,7 @@ app.all(/^\/api(\/.*)?$/, async (req, res) => {
 
     res.status(result.status).json(result.data)
   } catch (e) {
-    console.error(JSON.stringify({
-      t: new Date().toISOString(),
-      id: req.reqId,
-      level: 'error',
-      m: method,
-      u: url,
-      err: e?.message,
-      stack: e?.stack
-    }))
+    logger.error({ err: e, reqId: req.reqId, method, url }, 'api dispatch failed')
     // В prod НЕ возвращаем e.message клиенту — может утечь SQL-детали,
     // file paths, имена таблиц, accidental dumps. reqId — единственная
     // нить для корреляции с server-логом.
@@ -1121,14 +1122,14 @@ app.all(/^\/api(\/.*)?$/, async (req, res) => {
 
 if (SERVE_STATIC) {
   if (!existsSync(DIST_DIR)) {
-    console.warn(`[server] SERVE_STATIC=true но ${DIST_DIR} не существует — сначала npm run build`)
+    serverLog.warn({ distDir: DIST_DIR }, 'SERVE_STATIC=true но dist не существует — сначала npm run build')
   } else {
     app.use(express.static(DIST_DIR, { maxAge: '1h', index: false }))
     app.get(/.*/, (req, res, next) => {
       if (req.path.startsWith('/api') || req.path === '/health') return next()
       res.sendFile(join(DIST_DIR, 'index.html'))
     })
-    console.log(`[server] serving static from ${DIST_DIR}`)
+    serverLog.info({ distDir: DIST_DIR }, 'serving static')
   }
 }
 
@@ -1152,19 +1153,28 @@ function maintenanceTick() {
   // 1) WAL auto-checkpoint: по размеру ИЛИ по возрасту (что наступит раньше).
   try {
     const walPath = getDbPath() + '-wal'
-    let walMB = 0
-    try { walMB = statSync(walPath).size / 1024 / 1024 } catch { /* no wal yet */ }
+    let walBytes = 0
+    try { walBytes = statSync(walPath).size } catch { /* no wal yet */ }
+    const walMB = bytesToMB(walBytes)
     const sizeOver = walMB > WAL_AUTO_CHECKPOINT_MB
-    const ageOver = (Date.now() - lastCheckpointAt) > WAL_MAX_AGE_MS && walMB > 0
+    const ageOver = (Date.now() - lastCheckpointAt) > WAL_MAX_AGE_MS && walBytes > 0
     if (sizeOver || ageOver) {
       flushPending()
       const result = walCheckpoint()
       lastCheckpointAt = Date.now()
-      const reason = sizeOver ? `size ${walMB.toFixed(1)}MB > ${WAL_AUTO_CHECKPOINT_MB}MB` : `age > ${Math.round(WAL_MAX_AGE_MS / 60_000)}min`
-      console.log(`[maintenance] wal checkpoint (${reason}):`, result)
+      maintLog.info(
+        {
+          trigger: sizeOver ? 'size' : 'age',
+          walMB,
+          thresholdMB: WAL_AUTO_CHECKPOINT_MB,
+          maxAgeMin: Math.round(WAL_MAX_AGE_MS / 60_000),
+          result
+        },
+        'wal checkpoint'
+      )
     }
   } catch (e) {
-    console.error('[maintenance] wal-checkpoint failed:', e.message)
+    maintLog.error({ err: e }, 'wal-checkpoint failed')
   }
   // 2) Auto-backup: VACUUM INTO раз в AUTO_BACKUP_INTERVAL_MS. flushPending
   // перед этим, чтобы pending-мутации тоже попали в снапшот; verify через
@@ -1178,41 +1188,39 @@ function maintenanceTick() {
       const dest = resolve(BACKUP_DIR, `app-${ts}.db`)
       const info = backupTo(dest)
       if (info.error) {
-        console.error('[maintenance] auto-backup failed:', info.error)
+        maintLog.error({ err: new Error(info.error) }, 'auto-backup failed')
       } else {
         const verify = verifyBackup(dest)
         if (verify.ok) {
-          const mb = (info.sizeBytes / 1024 / 1024).toFixed(1)
-          console.log(`[maintenance] auto-backup ${ts} (${mb}MB, ${verify.users} users)`)
+          maintLog.info({ ts, sizeMB: bytesToMB(info.sizeBytes), users: verify.users }, 'auto-backup ok')
           lastAutoBackupAt = Date.now()
         } else {
-          console.error('[maintenance] auto-backup verify failed:', verify.error || 'no users')
+          maintLog.error({ verifyError: verify.error || 'no users' }, 'auto-backup verify failed')
         }
       }
     } catch (e) {
-      console.error('[maintenance] auto-backup failed:', e.message)
+      maintLog.error({ err: e }, 'auto-backup failed')
     }
   }
   // 3) Backup retention
   try {
     const r = pruneOldBackups(BACKUP_DIR, BACKUP_KEEP_DAYS)
     if (r.removed.length > 0) {
-      const mb = (r.freedBytes / 1024 / 1024).toFixed(1)
-      console.log(`[maintenance] pruned ${r.removed.length} backup(s), freed ${mb}MB`)
+      maintLog.info({ removed: r.removed.length, freedMB: bytesToMB(r.freedBytes) }, 'pruned backups')
     }
   } catch (e) {
-    console.error('[maintenance] backup-prune failed:', e.message)
+    maintLog.error({ err: e }, 'backup-prune failed')
   }
   // 4) Expired refresh-sessions: чистим, чтобы массив не рос вечно.
   try {
     const n = cleanupExpiredSessions()
     if (n > 0) {
-      console.log(`[maintenance] expired ${n} refresh-session(s)`)
+      maintLog.info({ expired: n }, 'expired refresh-sessions')
       // Сразу планируем save: чтобы persisted db не отставал.
       scheduleSave()
     }
   } catch (e) {
-    console.error('[maintenance] session-cleanup failed:', e.message)
+    maintLog.error({ err: e }, 'session-cleanup failed')
   }
   // 5) Audit-ротация по возрасту. Хард-кап тикает at-insert (см. handlers.js),
   // здесь подрезаем «старое». Если AUDIT_KEEP_DAYS=0 — выключено.
@@ -1220,11 +1228,11 @@ function maintenanceTick() {
     try {
       const n = cleanupAudit(AUDIT_KEEP_DAYS * 86400_000)
       if (n > 0) {
-        console.log(`[maintenance] pruned ${n} audit record(s) older than ${AUDIT_KEEP_DAYS}d`)
+        maintLog.info({ pruned: n, olderThanDays: AUDIT_KEEP_DAYS }, 'pruned audit records')
         scheduleSave()
       }
     } catch (e) {
-      console.error('[maintenance] audit-cleanup failed:', e.message)
+      maintLog.error({ err: e }, 'audit-cleanup failed')
     }
   }
   // 6) Lockout-map cleanup: евиктим записи с истёкшим окном/локаутом.
@@ -1233,10 +1241,10 @@ function maintenanceTick() {
   try {
     const n = cleanupLoginFailures()
     if (n > 0) {
-      console.log(`[maintenance] evicted ${n} stale lockout entr${n === 1 ? 'y' : 'ies'}`)
+      maintLog.info({ evicted: n }, 'evicted stale lockout entries')
     }
   } catch (e) {
-    console.error('[maintenance] lockout-cleanup failed:', e.message)
+    maintLog.error({ err: e }, 'lockout-cleanup failed')
   }
 }
 
@@ -1258,7 +1266,7 @@ async function waitForDrain(timeoutMs) {
 async function shutdown(signal) {
   if (shuttingDown) return
   shuttingDown = true
-  console.log(`\n[server] ${signal} received, draining ${inflight} inflight req…`)
+  serverLog.info({ signal, inflight }, 'shutdown signal received, draining inflight requests')
   // Останавливаем фоновую maintenance (чтобы не дёргать БД во время flushSync).
   if (maintenanceTimer) {
     clearInterval(maintenanceTimer)
@@ -1268,9 +1276,9 @@ async function shutdown(signal) {
   if (httpServer) httpServer.close()
   const drained = await waitForDrain(SHUTDOWN_DRAIN_MS)
   if (drained) {
-    console.log('[server] drained, flushing db…')
+    serverLog.info('drained, flushing db')
   } else {
-    console.warn(`[server] drain timeout (${SHUTDOWN_DRAIN_MS}ms), ${inflight} req still inflight, forcing flush`)
+    serverLog.warn({ drainTimeoutMs: SHUTDOWN_DRAIN_MS, inflight }, 'drain timeout, forcing flush')
   }
   flushSync()
   process.exit(0)
@@ -1279,17 +1287,25 @@ async function shutdown(signal) {
 process.on('SIGINT', () => { shutdown('SIGINT') })
 process.on('SIGTERM', () => { shutdown('SIGTERM') })
 process.on('uncaughtException', (e) => {
-  console.error('[server] uncaught:', e)
+  serverLog.fatal({ err: e }, 'uncaught exception')
   flushSync()
   process.exit(1)
 })
 
 httpServer = app.listen(PORT, HOST, () => {
-  console.log(`[server] http://${HOST}:${PORT} (static=${SERVE_STATIC ? 'on' : 'off'})`)
+  serverLog.info({ host: HOST, port: PORT, static: SERVE_STATIC }, 'http server listening')
   // Запускаем фоновую maintenance только после успешного listen, чтобы при
   // ошибке bind'а не лезть в БД. unref() — таймер не блокирует event-loop
   // exit'а, если кто-то прибил httpServer мимо shutdown'а.
   maintenanceTimer = setInterval(maintenanceTick, MAINTENANCE_INTERVAL_MS)
   maintenanceTimer.unref()
-  console.log(`[maintenance] enabled (interval=${Math.round(MAINTENANCE_INTERVAL_MS / 1000)}s, walThreshold=${WAL_AUTO_CHECKPOINT_MB}MB, backupKeep=${BACKUP_KEEP_DAYS}d, auditKeep=${AUDIT_KEEP_DAYS}d)`)
+  maintLog.info(
+    {
+      intervalSec: Math.round(MAINTENANCE_INTERVAL_MS / 1000),
+      walThresholdMB: WAL_AUTO_CHECKPOINT_MB,
+      backupKeepDays: BACKUP_KEEP_DAYS,
+      auditKeepDays: AUDIT_KEEP_DAYS
+    },
+    'maintenance enabled'
+  )
 })

@@ -1,0 +1,14 @@
+node_modules
+dist
+.git
+.gitignore
+.env
+.env.local
+.eslintcache
+*.log
+data
+coverage
+.vscode
+.idea
+scripts/stress*.js
+scripts/stress*.test.js

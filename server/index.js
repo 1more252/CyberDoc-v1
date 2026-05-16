@@ -87,9 +87,15 @@ const BACKPRESSURE_RETRY_AFTER_S = Number(process.env.BACKPRESSURE_RETRY_AFTER_S
 // Сколько ждать дренажа inflight перед shutdown'ом.
 const SHUTDOWN_DRAIN_MS = Number(process.env.SHUTDOWN_DRAIN_MS) || 5000
 
-// CORS-allowlist. По умолчанию '*' (дев); в проде задаём список доменов
-// через запятую: ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
+// CORS-allowlist. В dev по умолчанию '*' (UX); в проде ОБЯЗАТЕЛЬНО задать
+// через ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com.
+// Открытый CORS в проде — это «любой сайт может дёрнуть нашу API из браузера
+// жертвы», классический CSRF-vector при stateful-сессиях.
+const IS_PROD = process.env.NODE_ENV === 'production'
+if (IS_PROD && !process.env.ALLOWED_ORIGINS) {
+  throw new Error('ALLOWED_ORIGINS is required in production (e.g. https://app.example.com,https://admin.example.com)')
+}
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || (IS_PROD ? '' : '*'))
   .split(',').map((s) => s.trim()).filter(Boolean)
 
 // Read-only режим: все мутации возвращают 503. Полезно при миграциях/backup'ах,

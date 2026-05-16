@@ -119,6 +119,13 @@ const WAL_MAX_AGE_MS = Number(process.env.WAL_MAX_AGE_MS) || 60 * 60_000
 // каждого создания бэкапа + раз в интервал maintenance.
 const BACKUP_KEEP_DAYS = Number(process.env.BACKUP_KEEP_DAYS) || 30
 
+// Авто-бэкап в maintenance: раз в AUTO_BACKUP_INTERVAL_MS делаем VACUUM INTO
+// data/backups/. Без этого админу надо самому дёргать /api/admin/backup — и в
+// 90% случаев он этого не делает, пока не случится катастрофа. Дефолт 24ч —
+// типичный compromise (потеря не более суток при ext4 corruption / диск-фейле).
+// 0 = выключено (для дев/CI/контейнеров с внешним бэкапом).
+const AUTO_BACKUP_INTERVAL_MS = Number(process.env.AUTO_BACKUP_INTERVAL_MS) || 24 * 60 * 60_000
+
 // Сколько дней хранить записи audit-лога. Старее — подрезаются в maintenance.
 // 90 дней покрывает квартальные ретроспективы и compliance-окно по умолчанию,
 // при этом не даёт массиву пухнуть на годы. Хард-кап AUDIT_HARD_CAP (10k записей,
@@ -681,6 +688,13 @@ app.get('/health', (req, res) => {
     // в клиенте, который шлёт один токен дважды). Любое значение — повод
     // посмотреть audit-лог с action=auth.refresh_replay.
     refresh: refreshRotationStats(),
+    // Возраст последнего успешного авто-бэкапа в секундах. lastAutoBackupAt
+    // инициализируется STARTED_AT, поэтому до первого бэкапа это просто uptime.
+    // Алерт-правило: ageSec > AUTO_BACKUP_INTERVAL_MS * 1.5 → бэкапы встали.
+    backup: {
+      autoIntervalSec: Math.floor(AUTO_BACKUP_INTERVAL_MS / 1000),
+      lastAgeSec: Math.floor((Date.now() - lastAutoBackupAt) / 1000)
+    },
     readOnly: READ_ONLY,
     shuttingDown
   })
@@ -764,6 +778,8 @@ app.get('/metrics', (req, res) => {
     single('apn_refresh_rotated_total', 'Successful refresh-token rotations', 'counter', rrs.rotated)
     single('apn_refresh_replay_total', 'Detected refresh-token replays (compromise indicator)', 'counter', rrs.replays)
     single('apn_refresh_history_size', 'Size of replay-detection history map', 'gauge', rrs.historySize)
+    single('apn_backup_last_age_seconds', 'Seconds since last successful auto-backup (0 if disabled)', 'gauge', AUTO_BACKUP_INTERVAL_MS > 0 ? Math.floor((Date.now() - lastAutoBackupAt) / 1000) : 0)
+    single('apn_backup_interval_seconds', 'Configured auto-backup interval (0 if disabled)', 'gauge', Math.floor(AUTO_BACKUP_INTERVAL_MS / 1000))
     grouped('apn_requests_total', 'HTTP requests by status class', 'counter', metrics.byStatusClass, 'status')
     grouped('apn_requests_by_method_total', 'HTTP requests by method', 'counter', metrics.byMethod, 'method')
     grouped('apn_requests_by_ua_class_total', 'HTTP requests by UA class (browser/bot/cli/unknown)', 'counter', metrics.byUaClass, 'ua_class')
@@ -1114,6 +1130,9 @@ let maintenanceTimer = null
 // либо ручное. Инициализируем STARTED_AT'ом — иначе первый tick сразу решит,
 // что чекпойнт «древний» (хотя по факту prosseся 0мс назад).
 let lastCheckpointAt = Date.now()
+// Время последнего успешного авто-бэкапа. Инициализация STARTED_AT'ом важна
+// для того же эффекта (иначе первый tick делает бэкап через 5мин после старта).
+let lastAutoBackupAt = Date.now()
 
 function maintenanceTick() {
   // 1) WAL auto-checkpoint: по размеру ИЛИ по возрасту (что наступит раньше).
@@ -1133,7 +1152,34 @@ function maintenanceTick() {
   } catch (e) {
     console.error('[maintenance] wal-checkpoint failed:', e.message)
   }
-  // 2) Backup retention
+  // 2) Auto-backup: VACUUM INTO раз в AUTO_BACKUP_INTERVAL_MS. flushPending
+  // перед этим, чтобы pending-мутации тоже попали в снапшот; verify через
+  // open-readonly + COUNT(users), битый бэкап логируется как error и НЕ
+  // обновляет lastAutoBackupAt (на следующем tick'е попробуем снова).
+  if (AUTO_BACKUP_INTERVAL_MS > 0 && (Date.now() - lastAutoBackupAt) >= AUTO_BACKUP_INTERVAL_MS) {
+    try {
+      mkdirSync(BACKUP_DIR, { recursive: true })
+      flushPending()
+      const ts = new Date().toISOString().replace(/[:.]/g, '-')
+      const dest = resolve(BACKUP_DIR, `app-${ts}.db`)
+      const info = backupTo(dest)
+      if (info.error) {
+        console.error('[maintenance] auto-backup failed:', info.error)
+      } else {
+        const verify = verifyBackup(dest)
+        if (verify.ok) {
+          const mb = (info.sizeBytes / 1024 / 1024).toFixed(1)
+          console.log(`[maintenance] auto-backup ${ts} (${mb}MB, ${verify.users} users)`)
+          lastAutoBackupAt = Date.now()
+        } else {
+          console.error('[maintenance] auto-backup verify failed:', verify.error || 'no users')
+        }
+      }
+    } catch (e) {
+      console.error('[maintenance] auto-backup failed:', e.message)
+    }
+  }
+  // 3) Backup retention
   try {
     const r = pruneOldBackups(BACKUP_DIR, BACKUP_KEEP_DAYS)
     if (r.removed.length > 0) {
@@ -1143,7 +1189,7 @@ function maintenanceTick() {
   } catch (e) {
     console.error('[maintenance] backup-prune failed:', e.message)
   }
-  // 3) Expired refresh-sessions: чистим, чтобы массив не рос вечно.
+  // 4) Expired refresh-sessions: чистим, чтобы массив не рос вечно.
   try {
     const n = cleanupExpiredSessions()
     if (n > 0) {
@@ -1154,7 +1200,7 @@ function maintenanceTick() {
   } catch (e) {
     console.error('[maintenance] session-cleanup failed:', e.message)
   }
-  // 4) Audit-ротация по возрасту. Хард-кап тикает at-insert (см. handlers.js),
+  // 5) Audit-ротация по возрасту. Хард-кап тикает at-insert (см. handlers.js),
   // здесь подрезаем «старое». Если AUDIT_KEEP_DAYS=0 — выключено.
   if (AUDIT_KEEP_DAYS > 0) {
     try {
@@ -1167,7 +1213,7 @@ function maintenanceTick() {
       console.error('[maintenance] audit-cleanup failed:', e.message)
     }
   }
-  // 5) Lockout-map cleanup: евиктим записи с истёкшим окном/локаутом.
+  // 6) Lockout-map cleanup: евиктим записи с истёкшим окном/локаутом.
   // Без этого Map рос монотонно при атаке с rotation usernames.
   // Чисто in-memory структура — scheduleSave() не нужен.
   try {

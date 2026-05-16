@@ -46,6 +46,43 @@ export function signJwt(payload) {
   return `${header}.${body}.${sig}`
 }
 
+// Верификация подписи + exp. Возвращает payload или null. Никаких throw —
+// caller проверяет null и решает сам (401 / игнор). Используется timing-safe
+// сравнение: обычный === позволяет атаковать подпись побайтово по времени
+// ответа (HMAC утечка). Не выполняем JSON.parse до проверки подписи —
+// это бесплатная DoS-поверхность (стрёмный payload может бросить).
+import { timingSafeEqual } from 'node:crypto'
+
+export function verifyJwt(token) {
+  if (typeof token !== 'string') return null
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  const [header, body, sig] = parts
+  const expectedSig = signSegment(header, body)
+  // Длины различаются → подпись точно левая, сразу мимо (без timingSafe-сравнения,
+  // которое требует Buffer'ов одной длины).
+  if (sig.length !== expectedSig.length) return null
+  try {
+    if (!timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))) return null
+  } catch {
+    return null
+  }
+  // Подпись верна — payload теперь trusted, можно парсить.
+  let payload
+  try {
+    const json = Buffer.from(body.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')
+    payload = JSON.parse(json)
+  } catch {
+    return null
+  }
+  if (typeof payload !== 'object' || !payload) return null
+  // exp в секундах (см. RFC 7519). 0 / отсутствие → не принимаем — это закрывает
+  // токены без срока (если кто-то закодит signJwt без exp).
+  const now = Math.floor(Date.now() / 1000)
+  if (typeof payload.exp !== 'number' || payload.exp <= now) return null
+  return payload
+}
+
 // ---------- compatibility shim ------------------------------------------
 //
 // `src/mock/handlers.js` импортирует `makeAccessToken`, `makeRefreshToken`

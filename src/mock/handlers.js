@@ -36,6 +36,18 @@ export function setPasswordHasher({ hash, verify, isHashed }) {
   if (isHashed) pwIsHashed = isHashed
 }
 
+// === TOKEN VERIFIER DI ===================================================
+// Default — parseJwt (decode-only). Реальный сервер должен инжектить
+// verifyJwt (HMAC + exp), иначе getCaller и meHandler принимают любой токен
+// без проверки подписи (auth-bypass). Этот DI нужен, чтобы handlers.js
+// оставался браузер-совместимым (нет access к crypto.timingSafeEqual)
+// и testable без поднятия HTTP-стека.
+let tokenVerifier = parseJwt
+
+export function setTokenVerifier(fn) {
+  if (typeof fn === 'function') tokenVerifier = fn
+}
+
 // === PER-ACCOUNT LOGIN LOCKOUT ==========================================
 // In-memory счётчик неудачных попыток входа: после LOGIN_FAILURE_LIMIT
 // промахов в окне LOGIN_FAILURE_WINDOW_MS аккаунт блокируется на
@@ -861,7 +873,7 @@ function adminLogoutAllHandler(username, caller) {
 function meHandler(headers) {
   const auth = headers?.authorization
   if (!auth?.startsWith('Bearer ')) return { status: 401, data: { error: 'no_token' } }
-  const payload = parseJwt(auth.slice(7))
+  const payload = tokenVerifier(auth.slice(7))
   if (!payload?.sub) return { status: 401, data: { error: 'invalid_token' } }
   const u = db.users.find((x) => x.username === payload.sub)
   if (!u) return { status: 404, data: { error: 'no_user' } }
@@ -2673,7 +2685,7 @@ function parseQuery(url) {
 function getCaller(headers) {
   const auth = headers?.authorization
   if (!auth?.startsWith('Bearer ')) return null
-  const payload = parseJwt(auth.slice(7))
+  const payload = tokenVerifier(auth.slice(7))
   if (!payload?.sub) return null
   return { username: payload.sub, role: payload.role }
 }

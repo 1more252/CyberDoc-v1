@@ -34,7 +34,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import { existsSync, statSync, mkdirSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher, cleanupExpiredSessions, cleanupAudit, cleanupLoginFailures, loginFailuresSize, loginFailuresByIpSize, refreshRotationStats } from '../src/mock/handlers.js'
+import { handleMockRequest, setMockDelayMs, setTokenSigner, setTokenVerifier, setPasswordHasher, cleanupExpiredSessions, cleanupAudit, cleanupLoginFailures, loginFailuresSize, loginFailuresByIpSize, refreshRotationStats } from '../src/mock/handlers.js'
 import { makeAccessToken, makeRefreshToken } from './jwt.js'
 import { hash as pwHash, verify as pwVerify, isHashed as pwIsHashed } from './password.js'
 import {
@@ -53,7 +53,7 @@ import {
   verifyBackup,
   pingDb
 } from './storage.js'
-import { parseJwt } from '../src/lib/jwt.js'
+import { verifyJwt } from './jwt.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const DIST_DIR = resolve(HERE, '..', 'dist')
@@ -156,6 +156,7 @@ const BULK_TIMEOUT_MS = Number(process.env.BULK_TIMEOUT_MS) || 120_000
 // Используется в load-/смок-тестах, в проде должен быть 0 (default).
 setMockDelayMs(Number(process.env.MOCK_DELAY_MS) || 0)
 setTokenSigner({ makeAccessToken, makeRefreshToken })
+setTokenVerifier(verifyJwt)
 setPasswordHasher({ hash: pwHash, verify: pwVerify, isHashed: pwIsHashed })
 
 importLegacyJsonIfEmpty()
@@ -510,12 +511,17 @@ function bumpIp(ip, delta) {
   else inflightByIp.set(ip, next)
 }
 
-// Достаём username из Bearer-токена без валидации подписи — это для квоты,
-// авторизацию делает handlers.js. Битый/просроченный токен → не учитываем.
+// Достаём username из Bearer-токена ПРОВЕРИВ подпись и exp. Это используется
+// для per-user квоты и квоты «не учитывать левые токены». Без verify атакующий
+// мог подсунуть произвольный sub и сбивать жертве inflight-счётчик.
 function callerName(req) {
+  // Если уже проверили в jwtVerifyMiddleware — переиспользуем результат.
+  if (req._verifiedJwt !== undefined) {
+    return req._verifiedJwt?.sub || req._verifiedJwt?.username || null
+  }
   const auth = req.headers.authorization || ''
   if (!auth.startsWith('Bearer ')) return null
-  const payload = parseJwt(auth.slice(7))
+  const payload = verifyJwt(auth.slice(7))
   return payload?.sub || payload?.username || null
 }
 
@@ -713,7 +719,7 @@ app.get('/ready', (_req, res) => {
 
 app.get('/metrics', (req, res) => {
   const auth = req.headers.authorization || ''
-  const payload = auth.startsWith('Bearer ') ? parseJwt(auth.slice(7)) : null
+  const payload = auth.startsWith('Bearer ') ? verifyJwt(auth.slice(7)) : null
   if (payload?.role !== 'admin') {
     return res.status(403).json({ error: 'admin_only' })
   }
@@ -936,7 +942,7 @@ app.use('/api', (req, res, next) => {
 
 function requireAdmin(req, res) {
   const auth = req.headers.authorization || ''
-  const payload = auth.startsWith('Bearer ') ? parseJwt(auth.slice(7)) : null
+  const payload = auth.startsWith('Bearer ') ? verifyJwt(auth.slice(7)) : null
   if (payload?.role !== 'admin') {
     res.status(403).json({ error: 'admin_only' })
     return null

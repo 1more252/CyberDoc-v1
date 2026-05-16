@@ -75,6 +75,15 @@ const PER_USER_INFLIGHT_LIMIT = Number(process.env.PER_USER_INFLIGHT_LIMIT) || 2
 // 50 — щедро для NAT (CGNAT, корп.офис), жёстко для атакующего бота.
 const PER_IP_INFLIGHT_LIMIT = Number(process.env.PER_IP_INFLIGHT_LIMIT) || 50
 
+// Глобальный потолок одновременных запросов на сервер. Выше него — 503
+// с Retry-After: клиент должен отступить, а не копить очередь, которая всё
+// равно выберет request-timeout и сожжёт ресурсы впустую. Это backpressure
+// поверх per-user/per-IP: даже легитимный трафик от множества IP'ов не
+// должен утопить сервер. 800 — потолок ~16× PER_IP_INFLIGHT_LIMIT,
+// т.е. сервер ловит шторм только когда десятки IP одновременно нагружают.
+const MAX_INFLIGHT_GLOBAL = Number(process.env.MAX_INFLIGHT_GLOBAL) || 800
+const BACKPRESSURE_RETRY_AFTER_S = Number(process.env.BACKPRESSURE_RETRY_AFTER_S) || 2
+
 // Сколько ждать дренажа inflight перед shutdown'ом.
 const SHUTDOWN_DRAIN_MS = Number(process.env.SHUTDOWN_DRAIN_MS) || 5000
 
@@ -357,7 +366,11 @@ const metrics = {
   byUaClass: { browser: 0, bot: 0, cli: 0, unknown: 0 },
   slowRequests: 0,      // >500ms
   errorResponses: 0,    // 5xx
-  totalLatencyMs: 0     // сумма для подсчёта среднего
+  totalLatencyMs: 0,    // сумма для подсчёта среднего
+  // Сколько запросов отбили по глобальному backpressure-капу (503).
+  // Это не то же самое, что 503 от shutdown'а или read-only — это
+  // именно перегрузка сервера, нужен отдельный счётчик для тренда.
+  backpressureShed: 0
 }
 
 // Грубая UA-классификация. Никакой репутации, просто bucket для метрик.
@@ -646,7 +659,9 @@ app.get('/health', (req, res) => {
       total: inflight,
       peak: peakInflight,
       uniqueUsers: inflightByUser.size,
-      uniqueIps: inflightByIp.size
+      uniqueIps: inflightByIp.size,
+      cap: MAX_INFLIGHT_GLOBAL,
+      shed: metrics.backpressureShed
     },
     // Размер lockout-map: важный signal под атакой. Норма <100, тысячи —
     // повод смотреть rate-limit логи и blocking-rules перед сервером.
@@ -732,6 +747,8 @@ app.get('/metrics', (req, res) => {
     single('apn_inflight_peak', 'Peak inflight requests since start', 'gauge', peakInflight)
     single('apn_inflight_users', 'Distinct authenticated users with inflight requests', 'gauge', inflightByUser.size)
     single('apn_inflight_ips', 'Distinct IPs with inflight requests', 'gauge', inflightByIp.size)
+    single('apn_inflight_cap', 'Global inflight backpressure cap', 'gauge', MAX_INFLIGHT_GLOBAL)
+    single('apn_backpressure_shed_total', 'Requests rejected by global backpressure (503)', 'counter', metrics.backpressureShed)
     single('apn_read_only', 'Whether READ_ONLY mode is on (1/0)', 'gauge', READ_ONLY ? 1 : 0)
     single('apn_mean_latency_ms', 'Mean response latency (ms) since start', 'gauge', meanLatency)
     single('apn_slow_requests_total', 'Requests slower than 500ms', 'counter', metrics.slowRequests)
@@ -782,7 +799,7 @@ app.get('/metrics', (req, res) => {
     byStatusClass: metrics.byStatusClass,
     byMethod: metrics.byMethod,
     byUaClass: metrics.byUaClass,
-    inflight: { current: inflight, peak: peakInflight, uniqueUsers: inflightByUser.size, uniqueIps: inflightByIp.size },
+    inflight: { current: inflight, peak: peakInflight, uniqueUsers: inflightByUser.size, uniqueIps: inflightByIp.size, cap: MAX_INFLIGHT_GLOBAL, shed: metrics.backpressureShed },
     // Top-50 ручек по count: route, p50/p95/p99, mean, slowCount. Достаточно
     // для триажа «какая ручка тормозит» без отдельного APM. Сортировка
     // на сервере, чтобы клиент не возился.
@@ -862,6 +879,19 @@ app.use('/api', apiLimiter)
 app.use('/api', (req, res, next) => {
   if (shuttingDown) {
     return res.status(503).json({ error: 'shutting_down', message: 'Сервер завершает работу.' })
+  }
+  // Глобальный backpressure: inflight уже учитывает текущий запрос (bump'нули
+  // в общем middleware выше), поэтому сравниваем строго >. Retry-After в
+  // секундах — RFC 7231 §7.1.3. Клиент видит подсказку и ретраит через паузу,
+  // вместо того чтобы долбить и копить очередь, которую мы всё равно дропнем
+  // по REQUEST_TIMEOUT_MS.
+  if (inflight > MAX_INFLIGHT_GLOBAL) {
+    metrics.backpressureShed++
+    res.setHeader('Retry-After', String(BACKPRESSURE_RETRY_AFTER_S))
+    return res.status(503).json({
+      error: 'overloaded',
+      message: `Сервер перегружен (inflight=${inflight} > ${MAX_INFLIGHT_GLOBAL}). Повтор через ${BACKPRESSURE_RETRY_AFTER_S}s.`
+    })
   }
   // READ_ONLY: мутации → 503. Исключения: login/refresh/logout (нужны для
   // авторизации админа в режиме обслуживания) и /admin/* (это и есть инструменты

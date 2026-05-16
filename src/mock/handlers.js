@@ -580,17 +580,39 @@ async function registerHandler(body, headers) {
 }
 
 function refreshHandler(body, headers) {
-  const username = db.refreshTokens.get(body?.refreshToken)
-  if (!username) return { status: 401, data: { error: 'invalid_refresh' } }
+  const presented = body?.refreshToken
+  const ip = String(headers?.['x-real-ip'] ?? '')
+  const username = db.refreshTokens.get(presented)
+  if (!username) {
+    // Replay-detection: если токена нет в активных, но он ЕСТЬ в истории
+    // использованных — это повторное использование уже отработавшего токена.
+    // Сценарий: атакующий перехватил refresh, legit-юзер тем временем уже
+    // использовал его (rotation сжёг старый), потом атакующий приходит с
+    // тем же токеном. Реакция: ревокать ВСЕ сессии юзера — не знаем кто
+    // из двух «настоящий», обоим придётся залогиниться заново. Это правильно:
+    // legit увидит «логнули из всех устройств» и сменит пароль.
+    const replayed = presented && usedRefreshTokens.get(presented)
+    if (replayed) {
+      refreshReplayCount++
+      revokeAllSessionsOf(replayed.username)
+      // Помечаем все остальные refresh-токены этого юзера тоже как «used» —
+      // иначе атакующий подберёт следующий refresh из перехваченной партии.
+      usedRefreshTokens.delete(presented) // конкретно этот уже отработал
+      logAudit(replayed.username, 'auth.refresh_replay', `user:${replayed.username}`,
+        'all_sessions_revoked', ip)
+      return { status: 401, data: { error: 'token_replayed', message: 'Подозрение на компрометацию токена. Все сессии отозваны, войдите заново.' } }
+    }
+    return { status: 401, data: { error: 'invalid_refresh' } }
+  }
   const u = db.users.find((x) => x.username === username)
   if (!u) return { status: 401, data: { error: 'invalid_refresh' } }
   // TTL-чек: absolute lifetime + idle timeout. Если сессия слишком стара ИЛИ
   // ей не пользовались дольше idle — отзываем и требуем повторный login.
-  const meta = db.refreshTokenMeta.find((s) => s.token === body.refreshToken)
+  const meta = db.refreshTokenMeta.find((s) => s.token === presented)
   if (meta) {
     const now = Date.now()
     if ((now - meta.createdAt) > REFRESH_TTL_MS || (now - meta.lastUsed) > REFRESH_IDLE_MS) {
-      revokeSession(body.refreshToken)
+      revokeSession(presented)
       return { status: 401, data: { error: 'session_expired' } }
     }
   }
@@ -601,10 +623,11 @@ function refreshHandler(body, headers) {
     blocked: u.blocked
   })
   const newRefresh = makeRefreshToken(u.username)
-  // Rotation: убираем старый, регистрируем новый. Если кто-то перехватил
-  // старый refresh — после rotation он невалиден.
-  revokeSession(body.refreshToken)
+  // Rotation: убираем старый, регистрируем новый, ЗАПОМИНАЕМ старый в replay-store.
+  revokeSession(presented)
+  markRefreshUsed(presented, u.username)
   registerSession(newRefresh, u.username, headers)
+  refreshRotatedCount++
   return { status: 200, data: { token, refreshToken: newRefresh } }
 }
 
@@ -626,6 +649,49 @@ function logoutHandler(body) {
 const REFRESH_TTL_MS = Number(process.env.REFRESH_TTL_MS) || 30 * 86400_000
 const REFRESH_IDLE_MS = Number(process.env.REFRESH_IDLE_MS) || 7 * 86400_000
 
+// История ОТРАБОТАННЫХ refresh-токенов: после rotation старый токен невалиден,
+// но мы помним его REPLAY_HISTORY_TTL_MS, чтобы отличить «токен никогда не
+// существовал» (просто 401) от «токен был валиден, но уже использован»
+// (replay → токен украден, надо ревокать все сессии этого юзера).
+// Map: token → {username, usedAt}. Hard-cap на размер чтобы не утечь.
+const REPLAY_HISTORY_TTL_MS = Number(process.env.REPLAY_HISTORY_TTL_MS) || 7 * 86400_000
+const REPLAY_HISTORY_MAX = Number(process.env.REPLAY_HISTORY_MAX) || 5000
+const usedRefreshTokens = new Map()
+
+// Метрики rotation/replay. Экспортируются через export'ы ниже, в /metrics
+// собирает server/index.js. Сбрасываются при рестарте — для накопления
+// нужен внешний exporter (TODO Phase: structured logs/pino).
+let refreshRotatedCount = 0
+let refreshReplayCount = 0
+
+export function refreshRotationStats() {
+  return { rotated: refreshRotatedCount, replays: refreshReplayCount, historySize: usedRefreshTokens.size }
+}
+
+// Запоминаем использованный токен. При переполнении выкидываем самый старый
+// (Map сохраняет insertion order — берём first key через iterator).
+function markRefreshUsed(token, username) {
+  if (usedRefreshTokens.size >= REPLAY_HISTORY_MAX) {
+    const firstKey = usedRefreshTokens.keys().next().value
+    if (firstKey) usedRefreshTokens.delete(firstKey)
+  }
+  usedRefreshTokens.set(token, { username, usedAt: Date.now() })
+}
+
+// Чистим протухшие записи из replay-истории. Вызывается из cleanupExpiredSessions
+// в maintenance-tick — общий цикл, не плодим таймеров.
+function cleanupReplayHistory() {
+  const cutoff = Date.now() - REPLAY_HISTORY_TTL_MS
+  let removed = 0
+  for (const [tok, meta] of usedRefreshTokens) {
+    if (meta.usedAt < cutoff) {
+      usedRefreshTokens.delete(tok)
+      removed++
+    }
+  }
+  return removed
+}
+
 // Максимум одновременных refresh-сессий на одного юзера. При превышении —
 // FIFO eviction (выкидываем самую старую по createdAt), новая сессия проходит.
 // Альтернатива «отбить новый логин» = DoS на легитимного юзера: достаточно
@@ -636,6 +702,8 @@ const SESSIONS_PER_USER_MAX = Number(process.env.SESSIONS_PER_USER_MAX) || 5
 
 // Чистит просроченные сессии. Возвращает кол-во удалённых. Идемпотентно.
 // Вызывается из server/index.js в maintenance-tick.
+// Заодно подрезаем replay-историю — оба касаются refresh-механики, разносить
+// в отдельный maintenance-шаг смысла нет.
 export function cleanupExpiredSessions() {
   const now = Date.now()
   const before = db.refreshTokenMeta.length
@@ -649,6 +717,7 @@ export function cleanupExpiredSessions() {
     }
   }
   if (survivors.length !== before) db.refreshTokenMeta = survivors
+  cleanupReplayHistory()
   return before - survivors.length
 }
 

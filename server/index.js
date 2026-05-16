@@ -34,7 +34,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import { existsSync, statSync, mkdirSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher, cleanupExpiredSessions, cleanupAudit, cleanupLoginFailures, loginFailuresSize, loginFailuresByIpSize } from '../src/mock/handlers.js'
+import { handleMockRequest, setMockDelayMs, setTokenSigner, setPasswordHasher, cleanupExpiredSessions, cleanupAudit, cleanupLoginFailures, loginFailuresSize, loginFailuresByIpSize, refreshRotationStats } from '../src/mock/handlers.js'
 import { makeAccessToken, makeRefreshToken } from './jwt.js'
 import { hash as pwHash, verify as pwVerify, isHashed as pwIsHashed } from './password.js'
 import {
@@ -656,6 +656,10 @@ app.get('/health', (req, res) => {
     // Кумулятивный счётчик 504-таймаутов: ненулевое значение значит —
     // в коде есть зависающие handler'ы (или backend под честной перегрузкой).
     requestTimeouts: requestTimeoutsTotal,
+    // Rotation/replay: replays>0 значит был перехват refresh'а (либо bug
+    // в клиенте, который шлёт один токен дважды). Любое значение — повод
+    // посмотреть audit-лог с action=auth.refresh_replay.
+    refresh: refreshRotationStats(),
     readOnly: READ_ONLY,
     shuttingDown
   })
@@ -733,6 +737,10 @@ app.get('/metrics', (req, res) => {
     single('apn_slow_requests_total', 'Requests slower than 500ms', 'counter', metrics.slowRequests)
     single('apn_error_responses_total', 'Responses with status >=500', 'counter', metrics.errorResponses)
     single('apn_request_timeouts_total', 'Requests aborted by per-request timeout cap', 'counter', requestTimeoutsTotal)
+    const rrs = refreshRotationStats()
+    single('apn_refresh_rotated_total', 'Successful refresh-token rotations', 'counter', rrs.rotated)
+    single('apn_refresh_replay_total', 'Detected refresh-token replays (compromise indicator)', 'counter', rrs.replays)
+    single('apn_refresh_history_size', 'Size of replay-detection history map', 'gauge', rrs.historySize)
     grouped('apn_requests_total', 'HTTP requests by status class', 'counter', metrics.byStatusClass, 'status')
     grouped('apn_requests_by_method_total', 'HTTP requests by method', 'counter', metrics.byMethod, 'method')
     grouped('apn_requests_by_ua_class_total', 'HTTP requests by UA class (browser/bot/cli/unknown)', 'counter', metrics.byUaClass, 'ua_class')
@@ -770,6 +778,7 @@ app.get('/metrics', (req, res) => {
     slowRequests: metrics.slowRequests,
     errorResponses: metrics.errorResponses,
     requestTimeouts: requestTimeoutsTotal,
+    refresh: refreshRotationStats(),
     byStatusClass: metrics.byStatusClass,
     byMethod: metrics.byMethod,
     byUaClass: metrics.byUaClass,

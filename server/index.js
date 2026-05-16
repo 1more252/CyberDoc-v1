@@ -50,7 +50,8 @@ import {
   backupTo,
   pruneOldBackups,
   getTableStats,
-  verifyBackup
+  verifyBackup,
+  pingDb
 } from './storage.js'
 import { parseJwt } from '../src/lib/jwt.js'
 
@@ -97,6 +98,13 @@ const WAL_ALERT_MB = Number(process.env.WAL_ALERT_MB) || 100
 // Авто-checkpoint срабатывает заранее, до alert-порога — чтобы админу не
 // приходилось ничего делать руками. По умолчанию 50MB (половина alert'а).
 const WAL_AUTO_CHECKPOINT_MB = Number(process.env.WAL_AUTO_CHECKPOINT_MB) || 50
+
+// Time-trigger для WAL-checkpoint: даже если -wal не распух (мало записи),
+// его всё равно полезно сбрасывать раз в час. Иначе при низкой нагрузке
+// WAL остаётся «вечно открытым», readers в SQLite видят старые версии,
+// и на shutdown'е flush растягивается. 1ч — баланс между «дёргаем диск
+// слишком часто» и «БД фактически без checkpoint'а сутками».
+const WAL_MAX_AGE_MS = Number(process.env.WAL_MAX_AGE_MS) || 60 * 60_000
 
 // Сколько дней хранить бэкапы в data/backups/. Старее — чистятся после
 // каждого создания бэкапа + раз в интервал maintenance.
@@ -343,9 +351,25 @@ const metrics = {
   totalRequests: 0,
   byStatusClass: { '2xx': 0, '3xx': 0, '4xx': 0, '5xx': 0 },
   byMethod: {},
+  // UA-классы: видно, кто грузит — реальные пользователи (browser), боты-сканеры
+  // (bot), скрипты/CLI (cli), либо неопознанные (unknown). Без UA-парсинга
+  // (regexp по подстроке) — для трендов достаточно, парсер не нужен.
+  byUaClass: { browser: 0, bot: 0, cli: 0, unknown: 0 },
   slowRequests: 0,      // >500ms
   errorResponses: 0,    // 5xx
   totalLatencyMs: 0     // сумма для подсчёта среднего
+}
+
+// Грубая UA-классификация. Никакой репутации, просто bucket для метрик.
+// Порядок проверки важен: 'bot' идёт перед 'browser', т.к. многие краулеры
+// маскируются под Chrome (Googlebot и т.п.).
+function classifyUa(ua) {
+  if (!ua) return 'unknown'
+  const s = ua.toLowerCase()
+  if (s.includes('bot') || s.includes('crawler') || s.includes('spider') || s.includes('scanner')) return 'bot'
+  if (s.startsWith('curl/') || s.startsWith('wget/') || s.includes('python-requests') || s.includes('node-fetch') || s.includes('axios')) return 'cli'
+  if (s.includes('mozilla/') || s.includes('chrome/') || s.includes('safari/') || s.includes('firefox/')) return 'browser'
+  return 'unknown'
 }
 
 // --- per-route latency tracking -----------------------------------------
@@ -356,7 +380,19 @@ const LATENCY_SAMPLES = 200
 // Hard-cap на кол-во отслеживаемых ручек. Если кто-то начнёт фаззить URL'ы —
 // после порога новые route'ы складываются в спец-bucket 'other' вместо роста Map.
 const ROUTE_METRICS_MAX = 100
-const routeMetrics = new Map() // key → {count, totalMs, samples, idx, filled, slow}
+const routeMetrics = new Map() // key → {count, totalMs, samples, idx, filled, slow, baselineP95, lastAlertAt}
+
+// Slow-burn detector: после того как ring заполнен впервые, фиксируем baselineP95.
+// Дальше каждые SLOW_BURN_CHECK_EVERY сэмплов сравниваем текущий p95: если
+// в SLOW_BURN_MULTIPLIER раз хуже baseline — пишем warning. Тротлим на ручку,
+// чтобы не зафлудить лог при затяжной деградации. baseline не двигается —
+// иначе плавная деградация «нормализуется» через час и алерт замолкнет.
+const SLOW_BURN_MULTIPLIER = Number(process.env.SLOW_BURN_MULTIPLIER) || 2
+const SLOW_BURN_CHECK_EVERY = 50
+const SLOW_BURN_ALERT_THROTTLE_MS = 5 * 60_000
+// Ручки с baseline <SLOW_BURN_MIN_BASELINE_MS — слишком шумные для ratio:
+// 1мс → 3мс это «×3», но это шум планировщика, не деградация. Игнорим.
+const SLOW_BURN_MIN_BASELINE_MS = 5
 
 // Нормализатор пути в стабильный ключ: режем query, заменяем динамические сегменты
 // (числовые id, UUID, наши `audit-…`, `sess-…`, `org-…` etc.) на ':id', чтобы
@@ -396,6 +432,25 @@ function recordRouteLatency(key, ms) {
   r.samples[r.idx] = ms
   r.idx = (r.idx + 1) % LATENCY_SAMPLES
   if (r.filled < LATENCY_SAMPLES) r.filled++
+
+  // Slow-burn check: запускается только когда ring впервые заполнился (значит
+  // baseline репрезентативный, не от 5 запросов) и нечасто — раз в N сэмплов.
+  if (r.filled === LATENCY_SAMPLES) {
+    if (r.baselineP95 == null) {
+      r.baselineP95 = routeQuantile(r, 0.95)
+    } else if (r.count % SLOW_BURN_CHECK_EVERY === 0) {
+      const cur = routeQuantile(r, 0.95)
+      const threshold = Math.max(SLOW_BURN_MIN_BASELINE_MS, r.baselineP95 * SLOW_BURN_MULTIPLIER)
+      if (cur >= threshold) {
+        const now = Date.now()
+        if (!r.lastAlertAt || now - r.lastAlertAt > SLOW_BURN_ALERT_THROTTLE_MS) {
+          const ratio = r.baselineP95 > 0 ? (cur / r.baselineP95).toFixed(1) : '∞'
+          console.warn(`[slow-burn] ${key} p95=${cur}ms baseline=${r.baselineP95}ms (×${ratio}, samples=${r.count})`)
+          r.lastAlertAt = now
+        }
+      }
+    }
+  }
 }
 
 // Sort + index — k log k, не вызывается в горячем пути.
@@ -485,6 +540,8 @@ app.use((req, res, next) => {
     if (metrics.byStatusClass[cls] !== undefined) metrics.byStatusClass[cls]++
     if (res.statusCode >= 500) metrics.errorResponses++
     metrics.byMethod[req.method] = (metrics.byMethod[req.method] || 0) + 1
+    const uaClass = classifyUa(req.headers['user-agent'])
+    metrics.byUaClass[uaClass]++
     // Per-route reservoir: O(1) запись, percentile-stats читаются только в /metrics.
     recordRouteLatency(normalizeRouteKey(req.method, req.originalUrl), ms)
 
@@ -545,8 +602,15 @@ app.head('/health', (_req, res) => res.status(200).end())
 app.head('/version', (_req, res) => res.status(200).end())
 app.head('/ready', (_req, res) => res.status(readinessState().ok ? 200 : 503).end())
 
-app.get('/health', (_req, res) => {
+app.get('/health', (req, res) => {
   const mem = process.memoryUsage()
+  // Deep-режим: дополнительно дёргаем SQLite (SELECT 1 + pragma). Полезен
+  // в k8s readiness, когда «файл на месте, но БД залочена» — обычный /health
+  // об этом не узнает. Стоит в среднем 0.1-0.5мс. Запускаем только по явному
+  // запросу — чтобы базовый /health оставался free от БД и не мог упасть
+  // во время checkpoint'а/backup'а.
+  const deep = req.query.deep === '1' || req.query.deep === 'true'
+  const dbProbe = deep ? pingDb() : null
   // app.db + -wal + -shm: в WAL-режиме реальные данные лежат в -wal до
   // checkpoint'а, без суммы размер кажется аномально малым. -wal выносим
   // отдельно (раздутый -wal — частый источник «откуда место кончилось»).
@@ -555,8 +619,11 @@ app.get('/health', (_req, res) => {
   const walSize = files['-wal']?.sizeBytes ?? 0
   const walSizeMB = Math.round((walSize / 1024 / 1024) * 100) / 100
 
-  res.json({
-    ok: true,
+  // Deep-probe сделал select 1 — если упал, /health тоже должен сигналить
+  // не-200, иначе LB будет держать pod в ротации с битой БД.
+  const overallOk = !dbProbe || dbProbe.ok
+  res.status(overallOk ? 200 : 503).json({
+    ok: overallOk,
     uptime: Math.floor((Date.now() - STARTED_AT) / 1000),
     node: process.version,
     version: process.env.npm_package_version || '0.0.0',
@@ -566,7 +633,9 @@ app.get('/health', (_req, res) => {
       pendingWrites: hasPendingWrites(),
       sizeMB: Math.round((dbSize / 1024 / 1024) * 100) / 100,
       walSizeMB,
-      walAlert: walSizeMB > WAL_ALERT_MB
+      walAlert: walSizeMB > WAL_ALERT_MB,
+      // dbProbe — undefined в обычном режиме, объект {ok, latencyMs, ...} в deep
+      probe: dbProbe || undefined
     },
     mem: {
       rssMB: Math.round((mem.rss / 1024 / 1024) * 100) / 100,
@@ -666,6 +735,7 @@ app.get('/metrics', (req, res) => {
     single('apn_request_timeouts_total', 'Requests aborted by per-request timeout cap', 'counter', requestTimeoutsTotal)
     grouped('apn_requests_total', 'HTTP requests by status class', 'counter', metrics.byStatusClass, 'status')
     grouped('apn_requests_by_method_total', 'HTTP requests by method', 'counter', metrics.byMethod, 'method')
+    grouped('apn_requests_by_ua_class_total', 'HTTP requests by UA class (browser/bot/cli/unknown)', 'counter', metrics.byUaClass, 'ua_class')
 
     // Per-route метрики: top-50 по count (остальные глотает 'other' bucket).
     // Экспортируем как пять gauges + один counter — не настоящий histogram
@@ -702,6 +772,7 @@ app.get('/metrics', (req, res) => {
     requestTimeouts: requestTimeoutsTotal,
     byStatusClass: metrics.byStatusClass,
     byMethod: metrics.byMethod,
+    byUaClass: metrics.byUaClass,
     inflight: { current: inflight, peak: peakInflight, uniqueUsers: inflightByUser.size, uniqueIps: inflightByIp.size },
     // Top-50 ручек по count: route, p50/p95/p99, mean, slowCount. Достаточно
     // для триажа «какая ручка тормозит» без отдельного APM. Сортировка
@@ -814,6 +885,9 @@ app.post('/api/admin/wal-checkpoint', (req, res) => {
   // последние мутации.
   flushPending()
   const result = walCheckpoint()
+  // Ручной checkpoint тоже сдвигает таймер — иначе maintenance через секунду
+  // повторит «по возрасту», хотя только что чекпойнтили.
+  lastCheckpointAt = Date.now()
   res.json({ ok: true, ...result })
 })
 
@@ -835,6 +909,20 @@ app.post('/api/admin/backup', (req, res) => {
   // Битый бэкап == провал операции, не «success с предупреждением». Возвращаем
   // 500 чтобы alerting/CI заметили, payload оставляем (info+verify.error) для триажа.
   res.status(verify.ok ? 200 : 500).json(payload)
+})
+
+// Ручной trigger всех maintenance-шагов. Полезно когда нужно «прибраться сейчас»
+// (перед бэкапом, релизом, миграцией) без ожидания следующего MAINTENANCE_INTERVAL.
+// Запускает тот же maintenanceTick(), что и фоновый таймер — никакого
+// дублирования логики. Возвращает только подтверждение (детальные логи в stdout).
+app.post('/api/admin/maintenance', (req, res) => {
+  if (!requireAdmin(req, res)) return
+  try {
+    maintenanceTick()
+    res.json({ ok: true, ranAt: new Date().toISOString() })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
+  }
 })
 
 // Per-table статистика для capacity-планирования: сколько rows + bytes
@@ -948,17 +1036,25 @@ if (SERVE_STATIC) {
 // чтобы не засорять stdout «no-op» строками каждые 5 минут.
 
 let maintenanceTimer = null
+// Время последнего успешного checkpoint'а: либо по размеру, либо по времени,
+// либо ручное. Инициализируем STARTED_AT'ом — иначе первый tick сразу решит,
+// что чекпойнт «древний» (хотя по факту prosseся 0мс назад).
+let lastCheckpointAt = Date.now()
 
 function maintenanceTick() {
-  // 1) WAL auto-checkpoint
+  // 1) WAL auto-checkpoint: по размеру ИЛИ по возрасту (что наступит раньше).
   try {
     const walPath = getDbPath() + '-wal'
     let walMB = 0
     try { walMB = statSync(walPath).size / 1024 / 1024 } catch { /* no wal yet */ }
-    if (walMB > WAL_AUTO_CHECKPOINT_MB) {
+    const sizeOver = walMB > WAL_AUTO_CHECKPOINT_MB
+    const ageOver = (Date.now() - lastCheckpointAt) > WAL_MAX_AGE_MS && walMB > 0
+    if (sizeOver || ageOver) {
       flushPending()
       const result = walCheckpoint()
-      console.log(`[maintenance] wal ${walMB.toFixed(1)}MB > ${WAL_AUTO_CHECKPOINT_MB}MB → checkpoint:`, result)
+      lastCheckpointAt = Date.now()
+      const reason = sizeOver ? `size ${walMB.toFixed(1)}MB > ${WAL_AUTO_CHECKPOINT_MB}MB` : `age > ${Math.round(WAL_MAX_AGE_MS / 60_000)}min`
+      console.log(`[maintenance] wal checkpoint (${reason}):`, result)
     }
   } catch (e) {
     console.error('[maintenance] wal-checkpoint failed:', e.message)

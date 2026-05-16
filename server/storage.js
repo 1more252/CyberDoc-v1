@@ -224,6 +224,32 @@ export function walCheckpoint() {
   return sqlite.pragma('wal_checkpoint(TRUNCATE)')
 }
 
+// Deep probe для /health?deep=1: убеждаемся, что SQLite реально жив (не
+// просто файл на месте). SELECT 1 — самый дешёвый запрос; журналируется
+// в /tmp WAL, но не вызывает фактической записи. journal_mode и
+// page_count читаются PRAGMA'ми — тоже без I/O в горячей точке.
+// При ошибке возвращаем {ok:false, error} — caller возвращает 503.
+export function pingDb() {
+  const t0 = process.hrtime.bigint()
+  try {
+    const row = sqlite.prepare('SELECT 1 AS ok').get()
+    const journalMode = sqlite.pragma('journal_mode', { simple: true })
+    const pageCount = sqlite.pragma('page_count', { simple: true })
+    const pageSize = sqlite.pragma('page_size', { simple: true })
+    const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6
+    return {
+      ok: row?.ok === 1,
+      latencyMs: Math.round(elapsedMs * 100) / 100,
+      journalMode,
+      pageCount,
+      pageSize,
+      sizeBytes: pageCount * pageSize
+    }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+}
+
 // Атомарный бэкап через VACUUM INTO — консистентный снапшот без блокировок.
 export function backupTo(destPath) {
   try { unlinkSync(destPath) } catch { void 0 }

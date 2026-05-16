@@ -121,6 +121,18 @@ const MAX_FIELD_LEN = Number(process.env.MAX_FIELD_LEN) || 65_536
 // Глубина рекурсии при clamp'е — защита от циклических/глубоких структур.
 const MAX_FIELD_DEPTH = 16
 
+// --- per-request timeout cap -------------------------------------------
+// Зависший handler (бесконечный цикл в фильтре, забытый await, висящая
+// внешняя HTTP-зависимость) держит socket и слот в inflight-квоте до
+// бесконечности — несколько таких и весь PER_IP/PER_USER лимит съеден.
+// Каждый запрос получает hard-таймаут: на регулярные ручки — 30s, на
+// тяжёлые (bulk-upsert, wal-checkpoint, backup) — 120s (импорт 100×
+// строк под нагрузкой может занять 30-40s, оставляем запас).
+// По истечении: ответ 504 + force-destroy socket'а (TCP RST), чтобы
+// клиент не висел в ожидании FIN'а и handler гарантированно отвалился.
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 30_000
+const BULK_TIMEOUT_MS = Number(process.env.BULK_TIMEOUT_MS) || 120_000
+
 // --- bootstrap -----------------------------------------------------------
 
 // MOCK_DELAY_MS=200 — искусственная задержка на каждый dispatcher-вызов.
@@ -221,6 +233,50 @@ app.use((req, res, next) => {
       got: cl
     })
   }
+  next()
+})
+
+// --- per-request hard timeout -----------------------------------------
+// Таблица override'ов: первый prefix-match по (method,path) выигрывает.
+// Всё остальное → REQUEST_TIMEOUT_MS. Структурно идентично BODY_SIZE_LIMITS,
+// специально — чтобы политика timeout'ов читалась так же, как политика тел.
+const TIMEOUT_OVERRIDES = [
+  { method: 'POST', prefix: '/api/inn-registry/bulk-upsert', ms: BULK_TIMEOUT_MS },
+  { method: 'POST', prefix: '/api/admin/wal-checkpoint', ms: BULK_TIMEOUT_MS },
+  { method: 'POST', prefix: '/api/admin/backup', ms: BULK_TIMEOUT_MS }
+]
+function timeoutFor(method, path) {
+  for (const e of TIMEOUT_OVERRIDES) {
+    if (e.method === method && path.startsWith(e.prefix)) return e.ms
+  }
+  return REQUEST_TIMEOUT_MS
+}
+
+let requestTimeoutsTotal = 0
+app.use((req, res, next) => {
+  const ms = timeoutFor(req.method, req.path)
+  const timer = setTimeout(() => {
+    if (res.headersSent) return // ответ уже пошёл — поздно прерывать
+    requestTimeoutsTotal++
+    try {
+      res.status(504).json({
+        error: 'request_timeout',
+        message: `Запрос превысил лимит ${ms}мс и был прерван сервером.`,
+        limitMs: ms
+      })
+    } catch {
+      // если res уже закрыт — игнорируем, всё равно destroy()
+    }
+    // force-destroy socket: handler в JS-цикле никак не остановить, но
+    // мы хотя бы перестаём держать TCP-соединение и слот в inflight'е.
+    try { req.socket?.destroy() } catch { /* socket уже мёртв — ok */ }
+  }, ms)
+  // clearTimeout как на finish, так и на close — finish не вызывается
+  // если клиент оборвал коннект, close — наоборот не вызывается если
+  // ответ ушёл штатно. Оба нужны, иначе таймеры протекают.
+  const clear = () => clearTimeout(timer)
+  res.on('finish', clear)
+  res.on('close', clear)
   next()
 })
 
@@ -528,6 +584,9 @@ app.get('/health', (_req, res) => {
     // Per-username и per-IP трекеры — разные сигнатуры атак (см. handlers.js).
     lockoutEntries: loginFailuresSize(),
     lockoutIpEntries: loginFailuresByIpSize(),
+    // Кумулятивный счётчик 504-таймаутов: ненулевое значение значит —
+    // в коде есть зависающие handler'ы (или backend под честной перегрузкой).
+    requestTimeouts: requestTimeoutsTotal,
     readOnly: READ_ONLY,
     shuttingDown
   })
@@ -604,6 +663,7 @@ app.get('/metrics', (req, res) => {
     single('apn_mean_latency_ms', 'Mean response latency (ms) since start', 'gauge', meanLatency)
     single('apn_slow_requests_total', 'Requests slower than 500ms', 'counter', metrics.slowRequests)
     single('apn_error_responses_total', 'Responses with status >=500', 'counter', metrics.errorResponses)
+    single('apn_request_timeouts_total', 'Requests aborted by per-request timeout cap', 'counter', requestTimeoutsTotal)
     grouped('apn_requests_total', 'HTTP requests by status class', 'counter', metrics.byStatusClass, 'status')
     grouped('apn_requests_by_method_total', 'HTTP requests by method', 'counter', metrics.byMethod, 'method')
 
@@ -639,6 +699,7 @@ app.get('/metrics', (req, res) => {
     meanLatencyMs: meanLatency,
     slowRequests: metrics.slowRequests,
     errorResponses: metrics.errorResponses,
+    requestTimeouts: requestTimeoutsTotal,
     byStatusClass: metrics.byStatusClass,
     byMethod: metrics.byMethod,
     inflight: { current: inflight, peak: peakInflight, uniqueUsers: inflightByUser.size, uniqueIps: inflightByIp.size },

@@ -365,6 +365,203 @@ export function validateOrgPayload(body) {
   return null
 }
 
+// --- Allow-lists для enum-полей. Любое значение вне списка ловится 422-м
+// до записи в БД, чтобы фронт не мог подсунуть «status=hacked» через DevTools.
+// Source of truth — формы фронта (EquipmentFormPage.KIND_OPTIONS и т.д.).
+const EQUIPMENT_KINDS = new Set(['server', 'network', 'pc', 'printer', 'pos', 'ups', 'other'])
+const EQUIPMENT_STATUSES = new Set(['active', 'repair', 'decommissioned'])
+const SOFTWARE_CATEGORIES = new Set(['system', 'application'])
+const SECURITY_TOOL_STATUSES = new Set(['active', 'expired', 'decommissioned'])
+const THREAT_MODEL_STATUSES = new Set(['draft', 'finalized'])
+const INTRUDER_TYPES = new Set(['external', 'internal'])
+const INTRUDER_POTENTIALS = new Set(['basic', 'advanced'])
+const DOCUMENT_TYPES = new Set(['act', 'contract', 'protocol', 'order', 'report'])
+// 'archived' (а не 'decommissioned') — фронт InfoSystemsForm/List/Detail
+// используют именно это значение; меняем фронт == ломать существующие записи.
+const INFO_SYSTEM_STATUSES = new Set(['draft', 'active', 'archived'])
+
+// ISO-дата YYYY-MM-DD или пусто. Date.parse слишком либеральный (принимает
+// «1 jan»), поэтому regex + round-trip отсекают вещи вроде 2026-02-30.
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+function isIsoDateOrEmpty(s) {
+  if (s == null || s === '') return true
+  if (typeof s !== 'string' || !ISO_DATE_RE.test(s)) return false
+  const d = new Date(s + 'T00:00:00Z')
+  return !Number.isNaN(d.getTime()) && s === d.toISOString().slice(0, 10)
+}
+
+function validateStr(body, key, max, label = key) {
+  const v = body[key]
+  if (v == null || v === '') return null
+  if (typeof v !== 'string' && typeof v !== 'number') {
+    return `Поле ${label} должно быть строкой`
+  }
+  const len = typeof v === 'string' ? v.length : String(v).length
+  if (len > max) return `Поле ${label} слишком длинное (>${max} символов)`
+  return null
+}
+function validateReqStr(body, key, max, label = key) {
+  const v = typeof body[key] === 'string' ? body[key].trim() : ''
+  if (!v) return `Поле ${label} обязательно`
+  if (v.length > max) return `Поле ${label} слишком длинное (>${max} символов)`
+  return null
+}
+function validateEnum(body, key, allowed, label = key) {
+  if (body[key] == null || body[key] === '') return null
+  if (!allowed.has(body[key])) {
+    return `Поле ${label} имеет недопустимое значение`
+  }
+  return null
+}
+
+export function validateEquipmentPayload(body) {
+  if (!body || typeof body !== 'object') return 'Некорректный запрос'
+  const err =
+    validateReqStr(body, 'name', 200) ||
+    validateEnum(body, 'kind', EQUIPMENT_KINDS) ||
+    validateEnum(body, 'status', EQUIPMENT_STATUSES) ||
+    validateStr(body, 'model', 200) ||
+    validateStr(body, 'manufacturer', 200) ||
+    validateStr(body, 'serial', 100) ||
+    validateStr(body, 'inventoryNumber', 100) ||
+    validateStr(body, 'location', 300) ||
+    validateStr(body, 'notes', 2000)
+  if (err) return err
+  if (body.yearMade != null && body.yearMade !== '') {
+    const y = Number(body.yearMade)
+    const currentYear = new Date().getUTCFullYear()
+    if (!Number.isInteger(y) || y < 1950 || y > currentYear + 1) {
+      return 'Поле yearMade должно быть годом между 1950 и текущим'
+    }
+  }
+  return null
+}
+
+export function validateInfoSystemPayload(body) {
+  if (!body || typeof body !== 'object') return 'Некорректный запрос'
+  const err =
+    validateReqStr(body, 'name', 200) ||
+    validateReqStr(body, 'typeId', 100) ||
+    validateStr(body, 'classification', 500) ||
+    validateStr(body, 'purpose', 1000) ||
+    validateStr(body, 'address', 500) ||
+    validateStr(body, 'operatorName', 300) ||
+    validateStr(body, 'kiiCategory', 100) ||
+    validateStr(body, 'gisLevel', 100) ||
+    validateStr(body, 'notes', 2000) ||
+    validateEnum(body, 'status', INFO_SYSTEM_STATUSES)
+  if (err) return err
+  if (body.operatorInn && !isInnValid(String(body.operatorInn))) return 'Некорректный operatorInn'
+  if (body.operatorOgrn && !isOgrnValid(String(body.operatorOgrn))) return 'Некорректный operatorOgrn'
+  if (body.pdnSubjectsCount != null && body.pdnSubjectsCount !== '') {
+    const n = Number(body.pdnSubjectsCount)
+    if (!Number.isFinite(n) || n < 0 || n > 1e9) return 'Поле pdnSubjectsCount вне диапазона'
+  }
+  if (body.pdnCategories !== undefined) {
+    if (!Array.isArray(body.pdnCategories)) return 'Поле pdnCategories должно быть массивом'
+    if (body.pdnCategories.length > 20) return 'Поле pdnCategories слишком большое (>20)'
+    for (const c of body.pdnCategories) {
+      if (typeof c !== 'string' || c.length > 100) return 'Некорректный элемент pdnCategories'
+    }
+  }
+  return null
+}
+
+export function validateSoftwarePayload(body) {
+  if (!body || typeof body !== 'object') return 'Некорректный запрос'
+  return (
+    validateReqStr(body, 'name', 200) ||
+    validateEnum(body, 'category', SOFTWARE_CATEGORIES) ||
+    validateStr(body, 'kindId', 100) ||
+    validateStr(body, 'version', 100) ||
+    validateStr(body, 'vendor', 200) ||
+    validateStr(body, 'licenseType', 100) ||
+    validateStr(body, 'licenseInfo', 500) ||
+    validateStr(body, 'installPath', 500) ||
+    validateStr(body, 'notes', 2000)
+  )
+}
+
+export function validateSecurityToolPayload(body) {
+  if (!body || typeof body !== 'object') return 'Некорректный запрос'
+  const err =
+    validateStr(body, 'serialNumber', 200) ||
+    validateStr(body, 'licenseKey', 200) ||
+    validateEnum(body, 'status', SECURITY_TOOL_STATUSES) ||
+    validateStr(body, 'notes', 2000)
+  if (err) return err
+  if (!isIsoDateOrEmpty(body.licenseExpiresAt)) return 'Поле licenseExpiresAt должно быть в формате YYYY-MM-DD'
+  if (!isIsoDateOrEmpty(body.deployedAt)) return 'Поле deployedAt должно быть в формате YYYY-MM-DD'
+  return null
+}
+
+export function validateThreatModelPayload(body) {
+  if (!body || typeof body !== 'object') return 'Некорректный запрос'
+  let err =
+    validateStr(body, 'name', 200) ||
+    validateEnum(body, 'status', THREAT_MODEL_STATUSES) ||
+    validateStr(body, 'conclusion', 4000)
+  if (err) return err
+  if (body.intruder !== undefined) {
+    if (!body.intruder || typeof body.intruder !== 'object') return 'Поле intruder должно быть объектом'
+    err =
+      validateEnum(body.intruder, 'type', INTRUDER_TYPES, 'intruder.type') ||
+      validateEnum(body.intruder, 'potential', INTRUDER_POTENTIALS, 'intruder.potential') ||
+      validateStr(body.intruder, 'motivation', 1000, 'intruder.motivation')
+    if (err) return err
+    if (body.intruder.capabilities !== undefined) {
+      if (!Array.isArray(body.intruder.capabilities)) return 'Поле intruder.capabilities должно быть массивом'
+      if (body.intruder.capabilities.length > 100) return 'Слишком много capabilities (>100)'
+    }
+  }
+  if (body.threats !== undefined) {
+    if (!Array.isArray(body.threats)) return 'Поле threats должно быть массивом'
+    if (body.threats.length > 1000) return 'Слишком много threats (>1000)'
+  }
+  return null
+}
+
+export function validateDocumentPayload(body) {
+  if (!body || typeof body !== 'object') return 'Некорректный запрос'
+  const err =
+    validateReqStr(body, 'title', 200) ||
+    validateEnum(body, 'type', DOCUMENT_TYPES) ||
+    validateStr(body, 'number', 100) ||
+    validateStr(body, 'content', 50000)
+  if (err) return err
+  if (!isIsoDateOrEmpty(body.date)) return 'Поле date должно быть в формате YYYY-MM-DD'
+  return null
+}
+
+export function validatePersonalPayload(body) {
+  if (!body || typeof body !== 'object') return 'Некорректный запрос'
+  const err =
+    validateReqStr(body, 'lastName', 100) ||
+    validateReqStr(body, 'firstName', 100) ||
+    validateStr(body, 'middleName', 100) ||
+    validateStr(body, 'position', 200) ||
+    validateStr(body, 'department', 200) ||
+    validateStr(body, 'notes', 2000)
+  if (err) return err
+  if (body.email && !isEmailValid(String(body.email))) return 'Некорректный email'
+  if (body.phone && !isPhoneValid(String(body.phone))) return 'Некорректный телефон'
+  return null
+}
+
+export function validateInnRegistryItem(item) {
+  if (!item || typeof item !== 'object') return 'Некорректная запись'
+  const inn = typeof item.inn === 'string' ? item.inn.trim() : ''
+  if (!inn) return 'Поле inn обязательно'
+  if (!isInnValid(inn)) return 'Некорректный ИНН'
+  if (item.status != null && item.status !== '') {
+    if (typeof item.status !== 'string' || item.status.length > 50) return 'Некорректный status'
+  }
+  if (item.error != null && item.error !== '' && typeof item.error !== 'string') {
+    return 'Некорректный error'
+  }
+  return null
+}
+
 // === PAGE-SIZE CLAMP ====================================================
 // Защита от `?pageSize=999999`: возвращать огромные массивы — это и память,
 // и сеть, и время сериализации. Все list-хендлеры пропускают `pageSize`
@@ -1200,9 +1397,14 @@ function innBulkUpsertHandler(body, caller) {
   }
   const now = Date.now()
   const saved = []
+  const errors = []
   for (const item of incoming) {
-    const inn = String(item.inn ?? '').trim()
-    if (!inn) continue
+    const itemErr = validateInnRegistryItem(item)
+    if (itemErr) {
+      errors.push({ row: item, error: 'invalid_payload', message: itemErr })
+      continue
+    }
+    const inn = String(item.inn).trim()
     const existingIdx = db.innRegistry.findIndex(
       (x) => x.ownerUsername === caller.username && x.inn === inn
     )
@@ -1220,7 +1422,7 @@ function innBulkUpsertHandler(body, caller) {
     else db.innRegistry.push(record)
     saved.push(record)
   }
-  return { status: 200, data: { items: saved } }
+  return { status: 200, data: { items: saved, errors } }
 }
 
 function innDeleteHandler(id, caller) {
@@ -1291,6 +1493,9 @@ function equipmentCreateHandler(body, caller) {
       return { status: 400, data: { error: 'info_system_org_mismatch' } }
   }
 
+  const vErr = validateEquipmentPayload(body)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
+
   const now = Date.now()
   const e = {
     id: `eq-${now}-${Math.random().toString(36).slice(2, 6)}`,
@@ -1310,7 +1515,6 @@ function equipmentCreateHandler(body, caller) {
     createdAt: now,
     updatedAt: now
   }
-  if (!e.name) return { status: 400, data: { error: 'name_required' } }
   db.equipment.unshift(e)
   return { status: 201, data: e }
 }
@@ -1333,6 +1537,23 @@ function equipmentUpdateHandler(id, body, caller) {
     }
     nextInfoSystemId = v
   }
+
+  // Эффективный payload = текущая запись + патч. Так PATCH-style не ломается
+  // на отсутствующих обязательных полях (см. orgUpdate).
+  const effective = {
+    name: body?.name ?? e.name,
+    kind: body?.kind ?? e.kind,
+    model: body?.model ?? e.model,
+    manufacturer: body?.manufacturer ?? e.manufacturer,
+    serial: body?.serial ?? e.serial,
+    inventoryNumber: body?.inventoryNumber ?? e.inventoryNumber,
+    yearMade: body?.yearMade !== undefined ? body.yearMade : e.yearMade,
+    location: body?.location ?? e.location,
+    status: body?.status ?? e.status,
+    notes: body?.notes ?? e.notes
+  }
+  const vErr = validateEquipmentPayload(effective)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
 
   const merged = {
     ...e,
@@ -1414,7 +1635,9 @@ function docCreateHandler(body, caller) {
   if (!org) return { status: 404, data: { error: 'organization_not_found' } }
   if (caller.role === 'user' && org.ownerUsername !== caller.username)
     return { status: 403, data: { error: 'forbidden_org' } }
-  if (!body?.title?.trim()) return { status: 400, data: { error: 'title_required' } }
+
+  const vErr = validateDocumentPayload(body)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
 
   const now = Date.now()
   const d = {
@@ -1447,6 +1670,16 @@ function docUpdateHandler(id, body, caller) {
     return { status: 403, data: { error: 'forbidden' } }
   if (!['draft', 'rejected'].includes(d.status))
     return { status: 409, data: { error: 'wrong_status', current: d.status } }
+
+  const effective = {
+    title: body?.title ?? d.title,
+    type: body?.type ?? d.type,
+    number: body?.number ?? d.number,
+    date: body?.date ?? d.date,
+    content: body?.content ?? d.content
+  }
+  const vErr = validateDocumentPayload(effective)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
 
   const merged = {
     ...d,
@@ -1785,8 +2018,9 @@ function personalCreateHandler(body, caller) {
   if (!org) return { status: 404, data: { error: 'organization_not_found' } }
   if (caller.role === 'user' && org.ownerUsername !== caller.username)
     return { status: 403, data: { error: 'forbidden_org' } }
-  if (!body?.lastName?.trim() || !body?.firstName?.trim())
-    return { status: 400, data: { error: 'name_required' } }
+
+  const vErr = validatePersonalPayload(body)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
 
   const now = Date.now()
   const x = {
@@ -1817,6 +2051,20 @@ function personalUpdateHandler(id, body, caller) {
   const x = db.personal[idx]
   if (caller.role === 'user' && x.ownerUsername !== caller.username)
     return { status: 403, data: { error: 'forbidden' } }
+
+  const effective = {
+    lastName: body?.lastName ?? x.lastName,
+    firstName: body?.firstName ?? x.firstName,
+    middleName: body?.middleName ?? x.middleName,
+    position: body?.position ?? x.position,
+    department: body?.department ?? x.department,
+    phone: body?.phone ?? x.phone,
+    email: body?.email ?? x.email,
+    notes: body?.notes ?? x.notes
+  }
+  const vErr = validatePersonalPayload(effective)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
+
   const merged = {
     ...x,
     lastName: body?.lastName !== undefined ? String(body.lastName).trim() : x.lastName,
@@ -1871,6 +2119,11 @@ function personalBulkUpsertHandler(body, caller) {
     const firstName = String(raw?.firstName ?? '').trim()
     if (!lastName || !firstName) {
       errors.push({ row: raw, error: 'name_required' })
+      continue
+    }
+    const itemErr = validatePersonalPayload(raw)
+    if (itemErr) {
+      errors.push({ row: raw, error: 'invalid_payload', message: itemErr })
       continue
     }
     const key = (s) => String(s ?? '').trim().toLowerCase()
@@ -1955,8 +2208,9 @@ function infoSystemCreateHandler(body, caller) {
   if (!org) return { status: 404, data: { error: 'organization_not_found' } }
   if (caller.role === 'user' && org.ownerUsername !== caller.username)
     return { status: 403, data: { error: 'forbidden_org' } }
-  if (!body?.name?.trim()) return { status: 400, data: { error: 'name_required' } }
-  if (!body?.typeId) return { status: 400, data: { error: 'typeId_required' } }
+
+  const vErr = validateInfoSystemPayload(body)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
 
   const now = Date.now()
   const x = {
@@ -1996,6 +2250,26 @@ function infoSystemUpdateHandler(id, body, caller) {
   const x = db.infoSystems[idx]
   if (caller.role === 'user' && x.ownerUsername !== caller.username)
     return { status: 403, data: { error: 'forbidden' } }
+
+  const effective = {
+    name: body?.name ?? x.name,
+    typeId: body?.typeId ?? x.typeId,
+    classification: body?.classification ?? x.classification,
+    purpose: body?.purpose ?? x.purpose,
+    address: body?.address ?? x.address,
+    operatorName: body?.operatorName ?? x.operatorName,
+    operatorInn: body?.operatorInn ?? x.operatorInn,
+    operatorOgrn: body?.operatorOgrn ?? x.operatorOgrn,
+    kiiCategory: body?.kiiCategory ?? x.kiiCategory,
+    gisLevel: body?.gisLevel ?? x.gisLevel,
+    notes: body?.notes ?? x.notes,
+    status: body?.status ?? x.status,
+    pdnCategories: body?.pdnCategories !== undefined ? body.pdnCategories : x.pdnCategories,
+    pdnSubjectsCount: body?.pdnSubjectsCount !== undefined ? body.pdnSubjectsCount : x.pdnSubjectsCount
+  }
+  const vErr = validateInfoSystemPayload(effective)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
+
   const merged = {
     ...x,
     name: body?.name !== undefined ? String(body.name).trim() : x.name,
@@ -2180,6 +2454,9 @@ function softwareCreateHandler(body, caller) {
     if (is.organizationId !== orgId)
       return { status: 400, data: { error: 'info_system_org_mismatch' } }
   }
+
+  const vErr = validateSoftwarePayload(body)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
   const cat = body?.category === 'application' ? 'application' : 'system'
 
   const now = Date.now()
@@ -2200,7 +2477,6 @@ function softwareCreateHandler(body, caller) {
     createdAt: now,
     updatedAt: now
   }
-  if (!s.name) return { status: 400, data: { error: 'name_required' } }
   db.software.unshift(s)
   return { status: 201, data: s }
 }
@@ -2223,6 +2499,21 @@ function softwareUpdateHandler(id, body, caller) {
     }
     nextInfoSystemId = v
   }
+
+  const effective = {
+    name: body?.name ?? s.name,
+    category: body?.category ?? s.category,
+    kindId: body?.kindId ?? s.kindId,
+    version: body?.version ?? s.version,
+    vendor: body?.vendor ?? s.vendor,
+    licenseType: body?.licenseType ?? s.licenseType,
+    licenseInfo: body?.licenseInfo ?? s.licenseInfo,
+    installPath: body?.installPath ?? s.installPath,
+    notes: body?.notes ?? s.notes
+  }
+  const vErr = validateSoftwarePayload(effective)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
+
   const merged = {
     ...s,
     infoSystemId: nextInfoSystemId,
@@ -2439,6 +2730,9 @@ function stCreateHandler(body, caller) {
       return { status: 400, data: { error: 'info_system_org_mismatch' } }
   }
 
+  const vErr = validateSecurityToolPayload(body)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
+
   const now = Date.now()
   const s = {
     id: `st-${now}-${Math.random().toString(36).slice(2, 6)}`,
@@ -2485,6 +2779,17 @@ function stUpdateHandler(id, body, caller) {
     if (!c) return { status: 404, data: { error: 'catalog_not_found' } }
     nextCatalogId = body.catalogId
   }
+
+  const effective = {
+    serialNumber: body?.serialNumber ?? s.serialNumber,
+    licenseKey: body?.licenseKey ?? s.licenseKey,
+    licenseExpiresAt: body?.licenseExpiresAt ?? s.licenseExpiresAt,
+    deployedAt: body?.deployedAt ?? s.deployedAt,
+    status: body?.status ?? s.status,
+    notes: body?.notes ?? s.notes
+  }
+  const vErr = validateSecurityToolPayload(effective)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
 
   const merged = {
     ...s,
@@ -2750,6 +3055,9 @@ function tmCreateHandler(body, caller) {
   if (caller.role === 'user' && org.ownerUsername !== caller.username)
     return { status: 403, data: { error: 'forbidden_org' } }
 
+  const vErr = validateThreatModelPayload(body)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
+
   const now = Date.now()
   const m = {
     id: `tm-${now}-${Math.random().toString(36).slice(2, 6)}`,
@@ -2782,6 +3090,13 @@ function tmUpdateHandler(id, body, caller) {
   const m = db.threatModels[idx]
   if (caller.role === 'user' && m.ownerUsername !== caller.username)
     return { status: 403, data: { error: 'forbidden' } }
+
+  // Для update проверяем только то, что прилетело — name optional на update
+  // (в create оно может пустым строиться из ИС). intruder/threats шейп
+  // проверяем как пришло, не сливая с текущим (рекурсивный мердж сложнее
+  // оправдания — фронт всегда шлёт полный intruder при изменении).
+  const vErr = validateThreatModelPayload(body)
+  if (vErr) return { status: 422, data: { error: 'invalid_payload', message: vErr } }
 
   const merged = {
     ...m,

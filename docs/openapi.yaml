@@ -1,0 +1,609 @@
+openapi: 3.1.0
+info:
+  title: КиберДок — operational API
+  version: 0.1.0
+  description: |
+    OpenAPI-описание operational/observability эндпоинтов, поднятых напрямую
+    в `server/index.js`. Бизнес-API (`/api/auth/*`, `/api/organizations/*` и
+    прочие сущности) обрабатывается через router-dispatcher
+    `handleMockRequest()` в `src/mock/handlers.js` и здесь НЕ описано — см.
+    отдельную фазу/spec для бизнес-эндпоинтов.
+
+    Стиль ошибок: `{ "error": "<code>", "message": "<human>" }` для большинства
+    эндпоинтов; admin-операции возвращают `{ "ok": false, "error": "<code>", ... }`.
+
+servers:
+  - url: http://localhost:3001
+    description: Локальный dev/server
+  - url: /
+    description: Same-origin (за reverse-proxy)
+
+# Дефолт: без auth. Защищённые операции (admin/*, /metrics) переопределяют
+# локально через `security: [{ bearerAuth: [] }]`.
+security: []
+
+tags:
+  - name: health
+    description: Liveness / readiness / version пробы для LB и k8s
+  - name: metrics
+    description: Operational-метрики (admin-only)
+  - name: admin
+    description: Admin-операции над БД (backup, restore, maintenance)
+  - name: client-errors
+    description: Анонимный приём ошибок с фронта
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      operationId: getHealth
+      summary: Liveness-проба + детальный health-payload
+      description: |
+        Всегда отвечает (включая `shuttingDown`). 200 = жив; 503 = deep-probe
+        упал. `?deep=1` дополнительно делает `SELECT 1 + pragma` по SQLite
+        (~0.1-0.5мс). Без `deep` БД не трогается.
+      parameters:
+        - in: query
+          name: deep
+          description: Если `1` или `true` — добавить SQLite deep-probe
+          required: false
+          schema:
+            type: string
+            enum: ['1', 'true']
+      responses:
+        '200':
+          description: Сервер жив (deep-probe не запускался либо прошёл)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthPayload'
+        '503':
+          description: Deep-probe упал — БД недоступна
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthPayload'
+    head:
+      tags: [health]
+      operationId: headHealth
+      summary: Liveness HEAD (тело пустое)
+      responses:
+        '200':
+          description: Сервер жив
+  /version:
+    get:
+      tags: [health]
+      operationId: getVersion
+      summary: Версия билда, node, uptime
+      description: Без auth. Публичный fingerprint билда для ops.
+      responses:
+        '200':
+          description: Информация о билде
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version, node, env, commit, startedAt, uptimeSec]
+                properties:
+                  version: { type: string, example: '0.1.0' }
+                  node: { type: string, example: 'v22.12.0' }
+                  env: { type: string, example: 'production' }
+                  commit: { type: string, description: 'Короткий git-hash из VCS_SHA (пусто если CI не передал)' }
+                  startedAt: { type: string, format: date-time }
+                  uptimeSec: { type: integer, minimum: 0 }
+    head:
+      tags: [health]
+      operationId: headVersion
+      summary: Version HEAD (тело пустое)
+      responses:
+        '200':
+          description: OK
+  /ready:
+    get:
+      tags: [health]
+      operationId: getReady
+      summary: Readiness-проба для LB/k8s
+      description: |
+        200 = готов принимать трафик; 503 = `shuttingDown`/БД пуста/`READ_ONLY`.
+        Отличается от `/health` — last выводит 200 даже на shutdown'е.
+      responses:
+        '200':
+          description: Готов принимать трафик
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessState'
+        '503':
+          description: Не готов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessState'
+    head:
+      tags: [health]
+      operationId: headReady
+      summary: Readiness HEAD (тело пустое)
+      responses:
+        '200': { description: Готов }
+        '503': { description: Не готов }
+  /metrics:
+    get:
+      tags: [metrics]
+      operationId: getMetrics
+      summary: Operational-метрики (admin-only)
+      description: |
+        JSON по умолчанию; `?format=prom` → Prometheus exposition text/plain.
+        Включает counters/gauges (uptime, inflight, latency, refresh, backup)
+        и top-50 ручек по count.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: format
+          required: false
+          schema:
+            type: string
+            enum: [prom]
+      responses:
+        '200':
+          description: Метрики (JSON или Prom text)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsJson'
+            text/plain:
+              schema:
+                type: string
+                description: Prometheus exposition format
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+  /api/admin/wal-checkpoint:
+    post:
+      tags: [admin]
+      operationId: adminWalCheckpoint
+      summary: Принудительный WAL checkpoint
+      description: Сбрасывает pending-saves и делает `PRAGMA wal_checkpoint(TRUNCATE)`.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalCheckpointResult'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/admin/backup:
+    post:
+      tags: [admin]
+      operationId: adminBackup
+      summary: Ручной backup (VACUUM INTO) + verify + prune
+      description: |
+        Делает атомарный VACUUM INTO в `BACKUP_DIR/app-<ts>.db`, верифицирует
+        users>0, подчищает старые бэкапы по `BACKUP_KEEP_DAYS`. 500 если бэкап
+        битый (payload с verify.error).
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Бэкап готов и валиден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupResult'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '500':
+          description: Бэкап failed либо verify не прошёл
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupResult'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/admin/maintenance:
+    post:
+      tags: [admin]
+      operationId: adminMaintenance
+      summary: Ручной trigger maintenance-tick'а
+      description: Запускает тот же `maintenanceTick()`, что и фоновый таймер. Детальные логи в stdout.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Maintenance прошёл
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, ranAt]
+                properties:
+                  ok: { type: boolean, enum: [true] }
+                  ranAt: { type: string, format: date-time }
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '500':
+          description: Maintenance упал
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminErrorPayload'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/admin/db-stats:
+    get:
+      tags: [admin]
+      operationId: adminDbStats
+      summary: Per-table rows/bytes + размеры файлов БД
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Статистика
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DbStats'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/admin/backups:
+    get:
+      tags: [admin]
+      operationId: adminListBackups
+      summary: Список доступных бэкапов в BACKUP_DIR
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Список
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, dir]
+                properties:
+                  dir: { type: string }
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BackupListEntry'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/admin/restore:
+    post:
+      tags: [admin]
+      operationId: adminRestore
+      summary: Восстановление БД из бэкапа
+      description: |
+        Concurrent-safe: пока идёт восстановление, `inRestore`-middleware
+        отбивает остальные `/api/*` 503'ками. Поток: validate filename →
+        drain inflight → predecessor-backup (для отката) → restoreFromFile.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename]
+              properties:
+                filename:
+                  type: string
+                  description: Имя файла бэкапа (basename, `.db`, без сепараторов/`..`)
+                  example: app-2026-05-17T10-15-30-000Z.db
+      responses:
+        '200':
+          description: Восстановление прошло
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreResult'
+        '400':
+          description: Невалидное имя или битый бэкап
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminErrorPayload'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          description: Бэкап не найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminErrorPayload'
+        '500':
+          description: Predecessor-backup упал, либо ошибка применения
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminErrorPayload'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/client-errors:
+    post:
+      tags: [client-errors]
+      operationId: postClientError
+      summary: Приём ошибок с фронта (анонимно)
+      description: |
+        Без auth — нужен для отчётов до логина. Отдельный rate-limit (60/мин),
+        body cap 20kb. Лимиты полей дублируются в `src/lib/error-reporter.js`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClientErrorPayload'
+      responses:
+        '204':
+          description: Принято, тело пустое
+        '400':
+          description: Пустое поле message
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: [empty_message] }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  responses:
+    AdminOnly:
+      description: Требуется роль `admin`
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string, enum: [admin_only] }
+    RateLimited:
+      description: Превышен per-IP rate-limit
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RateLimitError'
+    Unavailable:
+      description: Сервер shutting down / restore in progress / READ_ONLY / перегружен
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: string
+                enum: [shutting_down, restore_in_progress, read_only, overloaded]
+              message: { type: string }
+  schemas:
+    HealthPayload:
+      type: object
+      required: [ok, uptime, node, version, env, db, mem, inflight, readOnly, shuttingDown]
+      properties:
+        ok: { type: boolean }
+        uptime: { type: integer, description: Uptime в секундах }
+        node: { type: string }
+        version: { type: string }
+        env: { type: string }
+        db:
+          type: object
+          properties:
+            users: { type: integer }
+            pendingWrites: { type: boolean }
+            sizeMB: { type: number }
+            walSizeMB: { type: number }
+            walAlert: { type: boolean, description: walSizeMB > WAL_ALERT_MB }
+            integrityCheckedAt: { type: integer, description: ms timestamp; присутствует если проверка была }
+            integrityCheckMs: { type: integer }
+            probe:
+              description: Только при `?deep=1`
+              type: object
+              properties:
+                ok: { type: boolean }
+                latencyMs: { type: number }
+        mem:
+          type: object
+          properties:
+            rssMB: { type: number }
+            heapUsedMB: { type: number }
+            heapTotalMB: { type: number }
+        inflight:
+          type: object
+          properties:
+            total: { type: integer }
+            peak: { type: integer }
+            uniqueUsers: { type: integer }
+            uniqueIps: { type: integer }
+            cap: { type: integer }
+            shed: { type: integer }
+        lockoutEntries: { type: integer }
+        lockoutIpEntries: { type: integer }
+        requestTimeouts: { type: integer }
+        refresh:
+          $ref: '#/components/schemas/RefreshRotationStats'
+        backup:
+          type: object
+          properties:
+            autoIntervalSec: { type: integer }
+            lastAgeSec: { type: integer }
+        readOnly: { type: boolean }
+        shuttingDown: { type: boolean }
+    ReadinessState:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        reason:
+          type: string
+          description: 'Причина 503: shutting_down | read_only | db_empty'
+          enum: [shutting_down, read_only, db_empty]
+    RefreshRotationStats:
+      type: object
+      properties:
+        rotated: { type: integer }
+        replays: { type: integer, description: 'replays>0 = подозрение на компрометацию refresh-токена' }
+        historySize: { type: integer }
+    MetricsJson:
+      type: object
+      properties:
+        uptimeSec: { type: integer }
+        totalRequests: { type: integer }
+        rps: { type: number }
+        meanLatencyMs: { type: number }
+        slowRequests: { type: integer }
+        errorResponses: { type: integer }
+        requestTimeouts: { type: integer }
+        refresh:
+          $ref: '#/components/schemas/RefreshRotationStats'
+        byStatusClass:
+          type: object
+          additionalProperties: { type: integer }
+        byMethod:
+          type: object
+          additionalProperties: { type: integer }
+        byUaClass:
+          type: object
+          additionalProperties: { type: integer }
+        inflight:
+          type: object
+          properties:
+            current: { type: integer }
+            peak: { type: integer }
+            uniqueUsers: { type: integer }
+            uniqueIps: { type: integer }
+            cap: { type: integer }
+            shed: { type: integer }
+        byRoute:
+          type: array
+          description: Top-50 ручек по count
+          items:
+            $ref: '#/components/schemas/RouteMetric'
+        readOnly: { type: boolean }
+    RouteMetric:
+      type: object
+      properties:
+        route: { type: string }
+        count: { type: integer }
+        p50: { type: number }
+        p95: { type: number }
+        p99: { type: number }
+        meanMs: { type: number }
+        slowCount: { type: integer }
+    WalCheckpointResult:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        busy: { type: integer, description: WAL pages busy (см. SQLite docs) }
+        log: { type: integer }
+        checkpointed: { type: integer }
+    BackupResult:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        path: { type: string }
+        sizeBytes: { type: integer }
+        durationMs: { type: integer }
+        verify:
+          type: object
+          properties:
+            ok: { type: boolean }
+            users: { type: integer }
+            sizeBytes: { type: integer }
+            error: { type: string }
+        pruned:
+          type: integer
+          description: Сколько старых бэкапов удалено
+        error: { type: string, description: 'Только при ok=false' }
+    DbStats:
+      type: object
+      properties:
+        tables:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              rows: { type: integer }
+              bytes: { type: integer }
+        totals:
+          type: object
+          properties:
+            rows: { type: integer }
+            bytes: { type: integer }
+        files:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              sizeBytes: { type: integer }
+              mtime: { type: string, format: date-time }
+        pendingWrites: { type: boolean }
+    BackupListEntry:
+      type: object
+      required: [name, sizeBytes, mtime]
+      properties:
+        name: { type: string, example: app-2026-05-17T10-15-30-000Z.db }
+        sizeBytes: { type: integer }
+        mtime: { type: string, format: date-time }
+    RestoreResult:
+      type: object
+      required: [ok, predecessor]
+      properties:
+        ok: { type: boolean, enum: [true] }
+        predecessor:
+          type: string
+          description: Путь к pre-restore backup'у (для ручного отката)
+        users: { type: integer }
+        sizeBytes: { type: integer }
+        durationMs: { type: integer }
+    AdminErrorPayload:
+      type: object
+      required: [ok, error]
+      properties:
+        ok: { type: boolean, enum: [false] }
+        error: { type: string, description: 'Код: invalid_filename | backup_not_found | backup_invalid | internal | predecessor_backup | restore_failed' }
+        stage: { type: string, description: 'Этап, на котором упало' }
+        detail: { type: string }
+    ClientErrorPayload:
+      type: object
+      required: [message]
+      description: Поля длиной обрезаются (см. CLIENT_ERROR_LIMITS).
+      properties:
+        message: { type: string, maxLength: 500 }
+        stack: { type: string, maxLength: 4000 }
+        source: { type: string, maxLength: 300 }
+        url: { type: string, maxLength: 500 }
+        userAgent: { type: string, maxLength: 200 }
+        kind:
+          type: string
+          maxLength: 32
+          enum: [vue, window, promise, unknown]
+        ts: { type: string, maxLength: 32 }
+    RateLimitError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          enum:
+            - rate_limited
+            - login_rate_limited
+            - admin_rate_limited
+            - mutation_rate_limited
+            - client_err_rate_limited
+        message: { type: string }

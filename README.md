@@ -29,3 +29,22 @@ npm run dev:full
 | admin   | admin123    | admin  |
 | expert  | expert123   | expert |
 | user    | user123     | user   |
+
+---
+
+## API-документация
+
+Operational/admin-эндпоинты сервера (`server/index.js`) описаны в [`docs/openapi.yaml`](docs/openapi.yaml) (OpenAPI 3.1):
+
+- `/health` `/version` `/ready` — пробы для LB/k8s
+- `/metrics` — метрики в JSON или Prometheus exposition (admin-only)
+- `/api/admin/*` — backup, restore, wal-checkpoint, maintenance, db-stats
+- `/api/client-errors` — приём ошибок с фронта
+
+Просмотр в swagger-ui / redoc:
+
+```bash
+npx --yes @redocly/cli@latest preview-docs docs/openapi.yaml
+```
+
+Бизнес-API (`/api/auth/*`, `/api/organizations/*`, etc.) обрабатывается через router-dispatcher в `src/mock/handlers.js` и в OpenAPI пока не описано.

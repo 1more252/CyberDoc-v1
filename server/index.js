@@ -55,7 +55,8 @@ import {
   listBackups,
   restoreFromFile,
   backupTimestamp,
-  pingDb
+  pingDb,
+  DATA_DIR
 } from './storage.js'
 import { verifyJwt } from './jwt.js'
 import { logger, serverLog, maintLog, clientErrLog } from './logger.js'
@@ -108,7 +109,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || (IS_PROD ? '' : '*'))
 const READ_ONLY = process.env.READ_ONLY === 'true'
 
 // Папка для бэкапов; создаётся лениво при первом запросе бэкапа.
-const BACKUP_DIR = resolve(HERE, '..', 'data', 'backups')
+// Derive от storage.js DATA_DIR — single source of truth для пути к данным.
+const BACKUP_DIR = resolve(DATA_DIR, 'backups')
 
 // Порог для warning по размеру -wal. Если -wal распух (нет checkpoint'ов
 // долго) — обычно симптом «висящих» readers или забытого админа. 100MB

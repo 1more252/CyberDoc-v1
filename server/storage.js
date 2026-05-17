@@ -23,7 +23,10 @@ import { _rehydrateSecurityState } from '../src/mock/handlers.js'
 import { storageLog } from './logger.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const DATA_DIR = resolve(HERE, '..', 'data')
+// DATA_DIR override — для e2e/CI/контейнеров, чтобы не писать в prod-data/.
+// Без env-вара дефолт repo-local data/, как было. Экспортируем — index.js
+// derive'ит BACKUP_DIR от того же корня, без повторного чтения env.
+export const DATA_DIR = process.env.DATA_DIR ? resolve(process.env.DATA_DIR) : resolve(HERE, '..', 'data')
 const DB_PATH = resolve(DATA_DIR, 'app.db')
 
 const SAVE_KEYS = [

@@ -54,7 +54,7 @@ import {
   pingDb
 } from './storage.js'
 import { verifyJwt } from './jwt.js'
-import { logger, serverLog, maintLog } from './logger.js'
+import { logger, serverLog, maintLog, clientErrLog } from './logger.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const DIST_DIR = resolve(HERE, '..', 'dist')
@@ -235,6 +235,7 @@ const BODY_SIZE_LIMITS = [
   { method: 'POST', prefix: '/api/auth/refresh', bytes: 1 * 1024 },
   { method: 'POST', prefix: '/api/auth/logout', bytes: 1 * 1024 },
   { method: 'POST', prefix: '/api/admin/change-password', bytes: 4 * 1024 },
+  { method: 'POST', prefix: '/api/client-errors', bytes: 20 * 1024 },
   // Bulk-upsert — единственная ручка, которая легитимно ест мегабайты.
   // 10MB совпадает с глобальным express.json — больше не пустим вообще.
   { method: 'POST', prefix: '/api/inn-registry/bulk-upsert', bytes: 10 * 1024 * 1024 }
@@ -899,8 +900,19 @@ const mutationLimiter = rateLimit({
     if (url.startsWith('/api/auth/login')) return true
     if (url.startsWith('/api/auth/register')) return true
     if (url.startsWith('/api/inn-registry/bulk-upsert')) return true
+    if (url.startsWith('/api/client-errors')) return true
     return false
   }
+})
+
+// Отдельный лимит на client-error reports: 60/мин с IP. Фронт сам клампится
+// до 5/мин уникальных, но злоумышленник может бить вручную, надо страховать.
+const clientErrLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'client_err_rate_limited' }
 })
 
 app.use('/api/auth/login', loginLimiter)
@@ -1068,6 +1080,39 @@ function isEtagRoute(url) {
   if (path.startsWith('/dictionaries/')) return true
   return false
 }
+
+// --- client error collection -------------------------------------------
+// Анонимный приём ошибок с фронта (Vue errorHandler, window error,
+// unhandledrejection). Не пишет в БД — только pino warn-лог. Без auth,
+// потому что часть ошибок (логин-форма падает, токен битый) случается
+// до авторизации. Защита: dedicated rate-limit, 20kb body cap.
+//
+// Лимиты дублируем из src/lib/error-reporter.js (CLIENT_ERROR_LIMITS) —
+// нельзя доверять клиентскому slice'у: ручной POST мимо фронта прошёл бы
+// без обрезки. KEEP IN SYNC с src/lib/error-reporter.js.
+const CLIENT_ERROR_LIMITS = {
+  message: 500, stack: 4000, source: 300, url: 500, ua: 200, kind: 32, ts: 32
+}
+const CLIENT_ERROR_KINDS = new Set(['vue', 'window', 'promise', 'unknown'])
+
+app.post('/api/client-errors', clientErrLimiter, (req, res) => {
+  const body = req.body || {}
+  const msg = String(body.message || '').slice(0, CLIENT_ERROR_LIMITS.message)
+  if (!msg) return res.status(400).json({ error: 'empty_message' })
+  const rawKind = String(body.kind || '').slice(0, CLIENT_ERROR_LIMITS.kind)
+  const kind = CLIENT_ERROR_KINDS.has(rawKind) ? rawKind : 'unknown'
+  clientErrLog.warn({
+    msg,
+    stack: String(body.stack || '').slice(0, CLIENT_ERROR_LIMITS.stack) || undefined,
+    kind,
+    source: body.source ? String(body.source).slice(0, CLIENT_ERROR_LIMITS.source) : undefined,
+    clientUrl: String(body.url || '').slice(0, CLIENT_ERROR_LIMITS.url) || undefined,
+    ua: String(body.userAgent || '').slice(0, CLIENT_ERROR_LIMITS.ua) || undefined,
+    clientTs: String(body.ts || '').slice(0, CLIENT_ERROR_LIMITS.ts) || undefined,
+    ip: req.ip
+  }, 'client error')
+  res.status(204).end()
+})
 
 // --- main API dispatcher -----------------------------------------------
 

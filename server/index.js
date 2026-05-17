@@ -312,10 +312,12 @@ app.use((req, res, next) => {
 // специально — чтобы политика timeout'ов читалась так же, как политика тел.
 const TIMEOUT_OVERRIDES = [
   { method: 'POST', prefix: '/api/inn-registry/bulk-upsert', ms: BULK_TIMEOUT_MS },
+  { method: 'POST', prefix: '/api/personal/bulk-upsert', ms: BULK_TIMEOUT_MS },
   { method: 'POST', prefix: '/api/admin/wal-checkpoint', ms: BULK_TIMEOUT_MS },
   { method: 'POST', prefix: '/api/admin/backup', ms: BULK_TIMEOUT_MS },
-  // restore делает predecessor-backup + copy + reload — на крупной БД дольше
-  // обычного bulk'а, поэтому ему отдельный таймаут с запасом.
+  // maintenance может запустить VACUUM INTO (auto-backup) + prune — на крупной
+  // БД дольше дефолтных 30с; restore — predecessor-backup + copy + reload.
+  { method: 'POST', prefix: '/api/admin/maintenance', ms: BULK_TIMEOUT_MS },
   { method: 'POST', prefix: '/api/admin/restore', ms: BULK_TIMEOUT_MS }
 ]
 function timeoutFor(method, path) {
@@ -934,6 +936,7 @@ const mutationLimiter = rateLimit({
     if (url.startsWith('/api/auth/login')) return true
     if (url.startsWith('/api/auth/register')) return true
     if (url.startsWith('/api/inn-registry/bulk-upsert')) return true
+    if (url.startsWith('/api/personal/bulk-upsert')) return true
     if (url.startsWith('/api/client-errors')) return true
     return false
   }

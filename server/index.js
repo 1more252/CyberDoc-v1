@@ -153,6 +153,19 @@ const MAINTENANCE_INTERVAL_MS = Number(process.env.MAINTENANCE_INTERVAL_MS) || 5
 // list-ответы превращаются в мегабайты. 64KB достаточно для документов
 // (HTML/markdown), на 2 порядка меньше body-limit (10MB).
 const MAX_FIELD_LEN = Number(process.env.MAX_FIELD_LEN) || 65_536
+
+// HSTS max-age: 1 год — стандарт для preload-list (hstspreload.org требует
+// ≥31536000). На non-HTTPS origin (включая localhost) браузер всё равно
+// игнорирует заголовок, поэтому одинаковое значение для dev/prod безопасно.
+const HSTS_MAX_AGE_S = 31_536_000
+
+// Permissions-Policy: явно отключаем сенсоры/устройства, которыми APN не
+// пользуется. helmet 8 не выставляет этот заголовок (бывший Feature-Policy
+// удалён), поэтому ставим вручную. Если внутри iframe какая-то библиотека
+// или встроенная страница попробует попросить mic/camera/geo — браузер
+// откажет без диалога согласия пользователя.
+const PERMISSIONS_POLICY =
+  'camera=(), microphone=(), geolocation=(), payment=(), usb=(), accelerometer=(), gyroscope=(), magnetometer=(), midi=()'
 // Глубина рекурсии при clamp'е — защита от циклических/глубоких структур.
 const MAX_FIELD_DEPTH = 16
 
@@ -216,18 +229,32 @@ app.use(
     contentSecurityPolicy: SERVE_STATIC
       ? {
           // Vite-сборка SPA — inline-стили допустимы; внешних источников нет.
+          // Директивы без fallback к default-src (frame-ancestors, base-uri,
+          // form-action, object-src, script-src-attr) указаны явно — иначе
+          // браузер применит permissive-дефолт.
           directives: {
             'default-src': ["'self'"],
             'script-src': ["'self'"],
+            'script-src-attr': ["'none'"],
             'style-src': ["'self'", "'unsafe-inline'"],
             'img-src': ["'self'", 'data:'],
             'font-src': ["'self'", 'data:'],
-            'connect-src': ["'self'"]
+            'connect-src': ["'self'"],
+            'object-src': ["'none'"],
+            'base-uri': ["'self'"],
+            'form-action': ["'self'"],
+            'frame-ancestors': ["'none'"]
           }
         }
-      : false
+      : false,
+    // includeSubDomains покрывает api.*, admin.* — все потомки.
+    strictTransportSecurity: { maxAge: HSTS_MAX_AGE_S, includeSubDomains: true }
   })
 )
+app.use((req, res, next) => {
+  res.setHeader('Permissions-Policy', PERMISSIONS_POLICY)
+  next()
+})
 // CORS: либо «*» (дев), либо строгий allowlist (прод).
 const corsOptions = {
   exposedHeaders: ['X-Request-Id', 'ETag'],

@@ -32,7 +32,7 @@ import compression from 'compression'
 import rateLimit from 'express-rate-limit'
 import { randomUUID, createHash } from 'node:crypto'
 import { existsSync, statSync, mkdirSync } from 'node:fs'
-import { dirname, resolve, join } from 'node:path'
+import { dirname, resolve, join, sep as pathSep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { handleMockRequest, setMockDelayMs, setTokenSigner, setTokenVerifier, setPasswordHasher, cleanupExpiredSessions, cleanupAudit, cleanupLoginFailures, loginFailuresSize, loginFailuresByIpSize, refreshRotationStats } from '../src/mock/handlers.js'
 import { makeAccessToken, makeRefreshToken } from './jwt.js'
@@ -52,6 +52,9 @@ import {
   getTableStats,
   verifyBackup,
   integrityCheck,
+  listBackups,
+  restoreFromFile,
+  backupTimestamp,
   pingDb
 } from './storage.js'
 import { verifyJwt } from './jwt.js'
@@ -182,7 +185,7 @@ serverLog.info(loaded ? 'loaded data from app.db' : 'cold start (empty db)')
 // crash'а во время checkpoint'а на разделе без fsync) ловим до того, как
 // фронт начнёт писать поверх повреждения и усугубит ситуацию. Падаем с
 // exit(2) — оркестратор переключит на standby/backup; ручной restore через
-// /api/admin/restore (см. Phase 31) или раскатка из data/backups/.
+// /api/admin/restore или раскатка из data/backups/.
 // Escape-hatch SKIP_STARTUP_INTEGRITY=1 — для аварийных рестартов, когда
 // нужно поднять сервис в read-only и подойти к восстановлению вручную.
 let lastIntegrityCheckedAt = 0
@@ -310,7 +313,10 @@ app.use((req, res, next) => {
 const TIMEOUT_OVERRIDES = [
   { method: 'POST', prefix: '/api/inn-registry/bulk-upsert', ms: BULK_TIMEOUT_MS },
   { method: 'POST', prefix: '/api/admin/wal-checkpoint', ms: BULK_TIMEOUT_MS },
-  { method: 'POST', prefix: '/api/admin/backup', ms: BULK_TIMEOUT_MS }
+  { method: 'POST', prefix: '/api/admin/backup', ms: BULK_TIMEOUT_MS },
+  // restore делает predecessor-backup + copy + reload — на крупной БД дольше
+  // обычного bulk'а, поэтому ему отдельный таймаут с запасом.
+  { method: 'POST', prefix: '/api/admin/restore', ms: BULK_TIMEOUT_MS }
 ]
 function timeoutFor(method, path) {
   for (const e of TIMEOUT_OVERRIDES) {
@@ -957,6 +963,11 @@ app.use('/api', (req, res, next) => {
   if (shuttingDown) {
     return res.status(503).json({ error: 'shutting_down', message: 'Сервер завершает работу.' })
   }
+  // inRestore: БД-инстанс closed/reopening — отбиваем запросы, иначе
+  // closed-instance crash. Restore-endpoint ставит флаг уже после middleware.
+  if (inRestore) {
+    return res.status(503).json({ error: 'restore_in_progress', message: 'Идёт восстановление БД.' })
+  }
   // Глобальный backpressure: inflight уже учитывает текущий запрос (bump'нули
   // в общем middleware выше), поэтому сравниваем строго >. Retry-After в
   // секундах — RFC 7231 §7.1.3. Клиент видит подсказку и ретраит через паузу,
@@ -1037,8 +1048,7 @@ app.post('/api/admin/backup', (req, res) => {
   if (!requireAdmin(req, res)) return
   try { mkdirSync(BACKUP_DIR, { recursive: true }) } catch { /* exists */ }
   flushPending()
-  const ts = new Date().toISOString().replace(/[:.]/g, '-')
-  const dest = resolve(BACKUP_DIR, `app-${ts}.db`)
+  const dest = resolve(BACKUP_DIR, `app-${backupTimestamp()}.db`)
   const info = backupTo(dest)
   if (info.error) return res.status(500).json({ ok: false, ...info })
   // Verify: открыть бэкап в read-only и убедиться что users > 0. Это ловит
@@ -1093,6 +1103,77 @@ app.get('/api/admin/db-stats', (req, res) => {
     files,
     pendingWrites: hasPendingWrites()
   })
+})
+
+app.get('/api/admin/backups', (req, res) => {
+  if (!requireAdmin(req, res)) return
+  res.json({ items: listBackups(BACKUP_DIR), dir: BACKUP_DIR })
+})
+
+// Восстановление БД из выбранного бэкапа. Concurrent-safe: второй параллельный
+// запрос получит 503 через inRestore-middleware. Поток: validate filename →
+// drain inflight → predecessor-backup → restoreFromFile → 200.
+app.post('/api/admin/restore', async (req, res) => {
+  if (!requireAdmin(req, res)) return
+
+  const filename = String(req.body?.filename || '').trim()
+  // Path-traversal: только basename, .db, без сепараторов/.. + resolve внутри BACKUP_DIR.
+  if (
+    !filename ||
+    !filename.endsWith('.db') ||
+    filename.includes('/') ||
+    filename.includes('\\') ||
+    filename.includes('..')
+  ) {
+    return res.status(400).json({ ok: false, error: 'invalid_filename' })
+  }
+  const srcPath = resolve(BACKUP_DIR, filename)
+  if (!srcPath.startsWith(BACKUP_DIR + pathSep) && srcPath !== BACKUP_DIR) {
+    return res.status(400).json({ ok: false, error: 'invalid_filename' })
+  }
+
+  // Probe источника ДО подмены: битый бэкап не должен убить рабочую БД.
+  // verifyBackup также ловит ENOENT (file missing → 404).
+  const probe = verifyBackup(srcPath)
+  if (!probe.ok) {
+    const status = probe.error && /ENOENT|no such file/i.test(probe.error) ? 404 : 400
+    const code = status === 404 ? 'backup_not_found' : 'backup_invalid'
+    return res.status(status).json({ ok: false, error: code, detail: probe.error || 'no users' })
+  }
+
+  inRestore = true
+  try {
+    serverLog.warn({ filename, size: probe.sizeBytes, users: probe.users }, 'restore: starting')
+
+    // Drain текущие inflight (новые уже отбиваются 503 через middleware).
+    const drained = await waitForDrain(SHUTDOWN_DRAIN_MS)
+    if (!drained) {
+      serverLog.warn({ inflight, drainTimeoutMs: SHUTDOWN_DRAIN_MS }, 'restore: drain timeout, proceeding')
+    }
+
+    // Predecessor-backup: VACUUM INTO текущей БД для ручного отката.
+    try { mkdirSync(BACKUP_DIR, { recursive: true }) } catch { /* exists */ }
+    flushPending()
+    const predecessor = resolve(BACKUP_DIR, `predecessor-${backupTimestamp()}.db`)
+    const predInfo = backupTo(predecessor)
+    if (predInfo.error) {
+      serverLog.error({ err: predInfo.error }, 'restore: predecessor backup failed, aborting')
+      return res.status(500).json({ ok: false, stage: 'predecessor_backup', error: predInfo.error })
+    }
+
+    const result = await restoreFromFile(srcPath)
+    if (!result.ok) {
+      serverLog.error({ result }, 'restore: failed')
+      return res.status(500).json({ ok: false, predecessor, ...result })
+    }
+    serverLog.warn({ filename, users: result.users, predecessor }, 'restore: completed')
+    res.json({ ok: true, predecessor, ...result })
+  } catch (e) {
+    serverLog.error({ err: e }, 'restore: exception')
+    res.status(500).json({ ok: false, error: IS_PROD ? 'internal' : e.message })
+  } finally {
+    inRestore = false
+  }
 })
 
 // --- ETag для read-only справочников -----------------------------------
@@ -1285,7 +1366,7 @@ function maintenanceTick() {
     try {
       mkdirSync(BACKUP_DIR, { recursive: true })
       flushPending()
-      const ts = new Date().toISOString().replace(/[:.]/g, '-')
+      const ts = backupTimestamp()
       const dest = resolve(BACKUP_DIR, `app-${ts}.db`)
       const info = backupTo(dest)
       if (info.error) {
@@ -1354,6 +1435,8 @@ function maintenanceTick() {
 // (или SHUTDOWN_DRAIN_MS), потом flushSync. Важно для bulk-импорта на 100.
 
 let shuttingDown = false
+// inRestore: транзиентный аналог shuttingDown на время restore (не exit'ит процесс).
+let inRestore = false
 let httpServer = null
 
 async function waitForDrain(timeoutMs) {

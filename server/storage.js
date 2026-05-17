@@ -15,7 +15,7 @@
 // ===========================================================================
 
 import Database from 'better-sqlite3'
-import { mkdirSync, existsSync, statSync, unlinkSync, readFileSync, readdirSync } from 'node:fs'
+import { mkdirSync, existsSync, statSync, unlinkSync, readFileSync, readdirSync, copyFileSync, renameSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { db } from '../src/mock/db.js'
@@ -51,16 +51,22 @@ const SAVE_KEYS = [
   'loginFailureByIpMeta'
 ]
 
-mkdirSync(DATA_DIR, { recursive: true })
-const sqlite = new Database(DB_PATH)
-sqlite.pragma('journal_mode = WAL')
-sqlite.pragma('synchronous = NORMAL')
+// `let` (не const): restoreFromFile() переоткрывает БД in-place. Прочие функции
+// читают `sqlite` через module-closure → видят новый instance прозрачно.
+let sqlite
 
-for (const key of SAVE_KEYS) {
-  sqlite.exec(
-    `CREATE TABLE IF NOT EXISTS "${key}" (id TEXT PRIMARY KEY, data TEXT NOT NULL)`
-  )
+function openDatabase(path) {
+  const inst = new Database(path)
+  inst.pragma('journal_mode = WAL')
+  inst.pragma('synchronous = NORMAL')
+  for (const key of SAVE_KEYS) {
+    inst.exec(`CREATE TABLE IF NOT EXISTS "${key}" (id TEXT PRIMARY KEY, data TEXT NOT NULL)`)
+  }
+  return inst
 }
+
+mkdirSync(DATA_DIR, { recursive: true })
+sqlite = openDatabase(DB_PATH)
 
 // ---------- load ---------------------------------------------------------
 
@@ -237,6 +243,76 @@ export function walCheckpoint() {
   return sqlite.pragma('wal_checkpoint(TRUNCATE)')
 }
 
+// Унифицированный обход BACKUP_DIR: .db-файлы → {name, path, st}.
+// Каталог может не существовать (первый запуск) — возвращаем [].
+// Используется listBackups и pruneOldBackups.
+function scanBackupDir(dir) {
+  let names
+  try { names = readdirSync(dir) } catch { return [] }
+  const out = []
+  for (const name of names) {
+    if (!name.endsWith('.db')) continue
+    const p = join(dir, name)
+    try {
+      out.push({ name, path: p, st: statSync(p) })
+    } catch { /* пропускаем недоступные */ }
+  }
+  return out
+}
+
+// Список .db-файлов в директории бэкапов, отсортированный по mtime DESC.
+export function listBackups(dir) {
+  return scanBackupDir(dir)
+    .map(({ name, st }) => ({ name, sizeBytes: st.size, mtime: st.mtime.toISOString() }))
+    .sort((a, b) => (a.mtime < b.mtime ? 1 : -1))
+}
+
+// ISO timestamp safe-for-filename (`:` и `.` → `-`). Используется для имён
+// бэкапов (manual, auto, predecessor) — общий формат упрощает сортировку.
+export function backupTimestamp() {
+  return new Date().toISOString().replace(/[:.]/g, '-')
+}
+
+// Восстановление БД из бэкапа: probe → copy в .new → close → swap → reopen → rehydrate.
+// Sidecar -wal/-shm удаляем перед swap'ом — они от старого .db и на новый не годятся.
+// Caller обязан сделать predecessor-бэкап до вызова — на случай битого srcPath.
+// Возвращает {ok, stage?, error?, sizeBytes?, users?, loaded?}.
+export async function restoreFromFile(srcPath) {
+  const probe = verifyBackup(srcPath)
+  if (!probe.ok) return { ok: false, stage: 'verify', error: probe.error || 'invalid_backup' }
+
+  const tempPath = DB_PATH + '.new'
+  try {
+    copyFileSync(srcPath, tempPath)
+  } catch (e) {
+    return { ok: false, stage: 'copy', error: e.message }
+  }
+
+  flushPending()
+  try { sqlite.close() } catch { /* ignore */ }
+
+  try { unlinkSync(DB_PATH + '-wal') } catch { /* may not exist */ }
+  try { unlinkSync(DB_PATH + '-shm') } catch { /* may not exist */ }
+
+  try {
+    renameSync(tempPath, DB_PATH)
+  } catch (e) {
+    // Rename упал — sqlite уже closed. Пытаемся открыть обратно текущий .db
+    // (если он ещё существует), чтобы хоть что-то отвечало.
+    try { sqlite = openDatabase(DB_PATH) } catch { /* fatal */ }
+    return { ok: false, stage: 'rename', error: e.message }
+  }
+
+  sqlite = openDatabase(DB_PATH)
+  // Сброс module-level state: checksums и pending от старого DB не валидны.
+  checksums.clear()
+  if (pending) { clearTimeout(pending); pending = null }
+  for (const key of SAVE_KEYS) db[key] = []
+
+  const loaded = await loadFromDisk()
+  return { ok: true, sizeBytes: probe.sizeBytes, users: probe.users, loaded }
+}
+
 // PRAGMA quick_check — структурная проверка БД без сверки индексов с rows
 // (полный integrity_check медленнее в 5-10× и редко даёт уникальные находки).
 // Возвращает {ok:true} при результате ['ok'], иначе {ok:false, problems:[...]}.
@@ -297,18 +373,12 @@ export function pruneOldBackups(dir, keepDays) {
   const cutoff = Date.now() - keepDays * 86400_000
   const removed = []
   let freedBytes = 0
-  let files
-  try { files = readdirSync(dir) } catch { return { removed, freedBytes } }
-  for (const name of files) {
-    if (!name.endsWith('.db')) continue
-    const p = join(dir, name)
+  for (const { name, path: p, st } of scanBackupDir(dir)) {
+    if (st.mtimeMs >= cutoff) continue
     try {
-      const st = statSync(p)
-      if (st.mtimeMs < cutoff) {
-        freedBytes += st.size
-        unlinkSync(p)
-        removed.push(name)
-      }
+      freedBytes += st.size
+      unlinkSync(p)
+      removed.push(name)
     } catch { /* пропускаем недоступные */ }
   }
   return { removed, freedBytes }

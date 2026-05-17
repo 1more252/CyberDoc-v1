@@ -37,5 +37,8 @@ export const adminApi = {
   dbStats: () => http.get('/admin/db-stats').then((r) => r.data),
   walCheckpoint: () => http.post('/admin/wal-checkpoint').then((r) => r.data),
   backup: () => http.post('/admin/backup').then((r) => r.data),
-  maintenance: () => http.post('/admin/maintenance').then((r) => r.data)
+  maintenance: () => http.post('/admin/maintenance').then((r) => r.data),
+  listBackups: () => http.get('/admin/backups').then((r) => r.data),
+  restoreBackup: (filename) =>
+    http.post('/admin/restore', { filename }, { timeout: 120000 }).then((r) => r.data)
 }

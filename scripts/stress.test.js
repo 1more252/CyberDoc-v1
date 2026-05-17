@@ -233,11 +233,11 @@ function seedHugeDb() {
   for (let i = 0; i < AUDIT_TOTAL; i++) {
     db.audit.push({
       id: `bench-audit-${i}`,
-      ts: NOW - i * 1000,
+      at: NOW - i * 1000,
       actor: HEAVY_USER,
       action: 'op',
       target: `t-${i}`,
-      meta: {}
+      details: ''
     })
   }
 

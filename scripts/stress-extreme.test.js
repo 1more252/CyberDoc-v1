@@ -270,8 +270,8 @@ function seedExtreme() {
   // audit
   for (let i = 0; i < AUDIT_TOTAL; i++) {
     db.audit.push({
-      id: `xa-${i}`, ts: NOW - i * 1000,
-      actor: HEAVY_USER, action: 'op', target: `t-${i}`, meta: {}
+      id: `xa-${i}`, at: NOW - i * 1000,
+      actor: HEAVY_USER, action: 'op', target: `t-${i}`, details: ''
     })
   }
 

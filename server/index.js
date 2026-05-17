@@ -51,6 +51,7 @@ import {
   pruneOldBackups,
   getTableStats,
   verifyBackup,
+  integrityCheck,
   pingDb
 } from './storage.js'
 import { verifyJwt } from './jwt.js'
@@ -176,6 +177,31 @@ setPasswordHasher({ hash: pwHash, verify: pwVerify, isHashed: pwIsHashed })
 importLegacyJsonIfEmpty()
 const loaded = await loadFromDisk()
 serverLog.info(loaded ? 'loaded data from app.db' : 'cold start (empty db)')
+
+// Структурная проверка SQLite-файла после load'а. Битый файл (например, после
+// crash'а во время checkpoint'а на разделе без fsync) ловим до того, как
+// фронт начнёт писать поверх повреждения и усугубит ситуацию. Падаем с
+// exit(2) — оркестратор переключит на standby/backup; ручной restore через
+// /api/admin/restore (см. Phase 31) или раскатка из data/backups/.
+// Escape-hatch SKIP_STARTUP_INTEGRITY=1 — для аварийных рестартов, когда
+// нужно поднять сервис в read-only и подойти к восстановлению вручную.
+let lastIntegrityCheckedAt = 0
+let lastIntegrityMs = 0
+if (process.env.SKIP_STARTUP_INTEGRITY === '1') {
+  serverLog.warn('db integrity check skipped (SKIP_STARTUP_INTEGRITY=1)')
+} else {
+  const startedAt = Date.now()
+  const r = integrityCheck()
+  lastIntegrityMs = Date.now() - startedAt
+  lastIntegrityCheckedAt = Date.now()
+  if (r.ok) {
+    serverLog.info({ ms: lastIntegrityMs }, 'db integrity ok')
+  } else {
+    serverLog.fatal({ ms: lastIntegrityMs, problems: r.problems, err: r.error }, 'db integrity check failed')
+    flushSync()
+    process.exit(2)
+  }
+}
 
 const app = express()
 if (TRUST_PROXY) app.set('trust proxy', 1)
@@ -676,6 +702,8 @@ app.get('/health', (req, res) => {
       sizeMB: bytesToMB(dbSize, 2),
       walSizeMB,
       walAlert: walSizeMB > WAL_ALERT_MB,
+      integrityCheckedAt: lastIntegrityCheckedAt || undefined,
+      integrityCheckMs: lastIntegrityMs || undefined,
       // dbProbe — undefined в обычном режиме, объект {ok, latencyMs, ...} в deep
       probe: dbProbe || undefined
     },
@@ -1193,9 +1221,17 @@ let lastCheckpointAt = Date.now()
 // Время последнего успешного авто-бэкапа. Инициализация STARTED_AT'ом важна
 // для того же эффекта (иначе первый tick делает бэкап через 5мин после старта).
 let lastAutoBackupAt = Date.now()
+// Throttle для WAL-alert-лога. Если -wal распух выше WAL_ALERT_MB и
+// checkpoint не помогает — значит readers держат старые snapshots или fs
+// не успевает; сигналим, но раз в 10 минут, чтобы не засорять лог.
+// Оscillation 200→50→200 в пределах окна замалчивается — alert нужен для
+// устойчивого роста, не для скачков.
+let lastWalAlertAt = 0
+const WAL_ALERT_THROTTLE_MS = 10 * 60_000
 
 function maintenanceTick() {
   // 1) WAL auto-checkpoint: по размеру ИЛИ по возрасту (что наступит раньше).
+  let postCheckpointWalMB = null
   try {
     const walPath = getDbPath() + '-wal'
     let walBytes = 0
@@ -1207,16 +1243,36 @@ function maintenanceTick() {
       flushPending()
       const result = walCheckpoint()
       lastCheckpointAt = Date.now()
+      // Распухший -wal после checkpoint'а = checkpointer вернулся busy
+      // (readers держат старый snapshot) → нужен alert ниже.
+      try { postCheckpointWalMB = bytesToMB(statSync(walPath).size) } catch { /* ignore */ }
       maintLog.info(
         {
           trigger: sizeOver ? 'size' : 'age',
           walMB,
           thresholdMB: WAL_AUTO_CHECKPOINT_MB,
           maxAgeMin: Math.round(WAL_MAX_AGE_MS / 60_000),
-          result
+          result,
+          afterMB: postCheckpointWalMB
         },
         'wal checkpoint'
       )
+    } else {
+      postCheckpointWalMB = walMB
+    }
+    // 1.5) WAL-alert. Если -wal > WAL_ALERT_MB даже после checkpoint'а (или
+    // тик случился до того, как сработал auto-checkpoint) — signal. Throttle
+    // 10 мин: alert важен, но не сто раз подряд в один и тот же лог.
+    if (
+      postCheckpointWalMB != null &&
+      postCheckpointWalMB > WAL_ALERT_MB &&
+      Date.now() - lastWalAlertAt > WAL_ALERT_THROTTLE_MS
+    ) {
+      maintLog.warn(
+        { walMB: postCheckpointWalMB, alertMB: WAL_ALERT_MB, checkpointAttempted: sizeOver || ageOver },
+        'wal size above alert threshold (readers may be pinning)'
+      )
+      lastWalAlertAt = Date.now()
     }
   } catch (e) {
     maintLog.error({ err: e }, 'wal-checkpoint failed')

@@ -237,6 +237,21 @@ export function walCheckpoint() {
   return sqlite.pragma('wal_checkpoint(TRUNCATE)')
 }
 
+// PRAGMA quick_check — структурная проверка БД без сверки индексов с rows
+// (полный integrity_check медленнее в 5-10× и редко даёт уникальные находки).
+// Возвращает {ok:true} при результате ['ok'], иначе {ok:false, problems:[...]}.
+// Время растёт со страницами: ~1мс/2MB, ~50мс/50MB, ~1-3с/1GB на SSD.
+export function integrityCheck() {
+  try {
+    const rows = sqlite.pragma('quick_check')
+    const lines = rows.map((r) => Object.values(r)[0])
+    if (lines.length === 1 && lines[0] === 'ok') return { ok: true }
+    return { ok: false, problems: lines }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+}
+
 // Deep probe для /health?deep=1: убеждаемся, что SQLite реально жив (не
 // просто файл на месте). SELECT 1 — самый дешёвый запрос; журналируется
 // в /tmp WAL, но не вызывает фактической записи. journal_mode и

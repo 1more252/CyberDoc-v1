@@ -35,6 +35,8 @@ export const adminApi = {
   // /admin/* под /api — авторизация через axios-interceptor (Bearer header).
   // Все возвращают 403 без admin-роли.
   dbStats: () => http.get('/admin/db-stats').then((r) => r.data),
+  // Лёгкий endpoint для audit-страницы — без полной table-стат.
+  auditRetention: () => http.get('/admin/audit-retention').then((r) => r.data),
   walCheckpoint: () => http.post('/admin/wal-checkpoint').then((r) => r.data),
   backup: () => http.post('/admin/backup').then((r) => r.data),
   maintenance: () => http.post('/admin/maintenance').then((r) => r.data),

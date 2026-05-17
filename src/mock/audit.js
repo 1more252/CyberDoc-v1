@@ -9,7 +9,20 @@
 
 import { db } from './db.js'
 
-const AUDIT_HARD_CAP = 10_000
+export const AUDIT_HARD_CAP = 10_000
+
+// Возвращает оперативную статистику для admin-панели: текущий размер,
+// timestamp самой старой записи (или null), хард-кап. AUDIT_KEEP_DAYS
+// живёт на уровне сервера — здесь его не знаем.
+export function auditStats() {
+  const rows = db.audit?.length ?? 0
+  if (rows === 0) return { rows: 0, oldestAt: null, hardCap: AUDIT_HARD_CAP }
+  // db.audit отсортирован новейшие→старейшие (unshift), значит самая старая
+  // в конце массива. На пустых записях at может отсутствовать — берём 0.
+  const oldest = db.audit[rows - 1]
+  const oldestAt = typeof oldest?.at === 'number' ? oldest.at : null
+  return { rows, oldestAt, hardCap: AUDIT_HARD_CAP }
+}
 
 // Локальные копии трivialьных хелперов — избегаем кругового импорта с handlers.js.
 const PAGE_SIZE_HARD_MAX = Number(process.env.PAGE_SIZE_HARD_MAX) || 500

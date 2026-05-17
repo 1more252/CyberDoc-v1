@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { adminApi } from './admin.api.js'
 import { useToast } from '@/ui/useToast.js'
 import { formatDateTime } from '@/lib/format.js'
+import { auditFillStatus } from './audit-retention.js'
 
 const toast = useToast()
 
@@ -11,6 +12,20 @@ const total = ref(0)
 const page = ref(1)
 const pageSize = ref(50)
 const loading = ref(false)
+
+// Audit retention status: лёгкий запрос (/admin/audit-retention), не тащит
+// полный db-stats. Подгружается один раз на mount, в перезагрузке списка
+// не участвует — значения медленно меняются и не критичны для UX списка.
+const retention = ref(null)
+async function loadRetention() {
+  try {
+    retention.value = await adminApi.auditRetention()
+  } catch {
+    retention.value = null
+  }
+}
+
+const retentionFill = computed(() => auditFillStatus(retention.value?.rows, retention.value?.hardCap, { lowSeverity: 'secondary' }))
 
 const search = ref('')
 const action = ref('')
@@ -76,7 +91,10 @@ const ACTION_BADGE = {
   'user.delete': 'text-bg-danger'
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadRetention()
+})
 </script>
 
 <template>
@@ -93,6 +111,29 @@ onMounted(load)
       >
         <i class="bi bi-arrow-clockwise me-1" /> Обновить
       </button>
+    </div>
+
+    <div
+      v-if="retention"
+      class="small text-secondary mb-3"
+    >
+      <span class="me-3">
+        <i class="bi bi-database me-1" />
+        {{ retention.rows.toLocaleString('ru-RU') }} / {{ retention.hardCap.toLocaleString('ru-RU') }} записей
+      </span>
+      <span
+        v-if="retention.keepDays > 0"
+        class="me-3"
+      >
+        <i class="bi bi-calendar3 me-1" />
+        Хранение {{ retention.keepDays }} дней
+      </span>
+      <span
+        v-if="retentionFill"
+        :class="`badge text-bg-${retentionFill.severity}`"
+      >
+        {{ retentionFill.pct }}% от хард-капа
+      </span>
     </div>
 
     <div :class="['cd-card p-3 mb-3']">

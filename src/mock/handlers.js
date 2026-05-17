@@ -4,10 +4,10 @@ import * as defaultPassword from './password.js'
 import { fnsLookup } from './fns.js'
 import { parseJwt } from '../lib/jwt.js'
 import { isInnValid } from '../lib/inn-validate.js'
-import { logAudit, logAuditDiff, auditListHandler, cleanupAudit } from './audit.js'
+import { logAudit, logAuditDiff, auditListHandler, cleanupAudit, auditStats } from './audit.js'
 
 // Re-export для server/index.js (публичный API сохраняем стабильным).
-export { cleanupAudit }
+export { cleanupAudit, auditStats }
 
 const FNS_CHUNK_LIMIT = 50
 const INN_BULK_LIMIT = 100

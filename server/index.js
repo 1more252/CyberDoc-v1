@@ -34,7 +34,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import { existsSync, statSync, mkdirSync } from 'node:fs'
 import { dirname, resolve, join, sep as pathSep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { handleMockRequest, setMockDelayMs, setTokenSigner, setTokenVerifier, setPasswordHasher, cleanupExpiredSessions, cleanupAudit, cleanupLoginFailures, loginFailuresSize, loginFailuresByIpSize, refreshRotationStats } from '../src/mock/handlers.js'
+import { handleMockRequest, setMockDelayMs, setTokenSigner, setTokenVerifier, setPasswordHasher, cleanupExpiredSessions, cleanupAudit, auditStats, cleanupLoginFailures, loginFailuresSize, loginFailuresByIpSize, refreshRotationStats } from '../src/mock/handlers.js'
 import { makeAccessToken, makeRefreshToken } from './jwt.js'
 import { hash as pwHash, verify as pwVerify, isHashed as pwIsHashed } from './password.js'
 import {
@@ -1100,17 +1100,43 @@ app.get('/api/admin/db-stats', (req, res) => {
     if (t.rows > 0) totalRows += t.rows
     if (t.bytes > 0) totalBytes += t.bytes
   }
+  // auditRetention дублируем для удобства: AdminSettingsPage уже грузит db-stats
+  // и читает блок отсюда; AdminAuditPage берёт более лёгкий /api/admin/audit-retention.
+  const a = auditStats()
   res.json({
     tables,
     totals: { rows: totalRows, bytes: totalBytes },
     files,
-    pendingWrites: hasPendingWrites()
+    pendingWrites: hasPendingWrites(),
+    auditRetention: {
+      rows: a.rows,
+      oldestAt: a.oldestAt,
+      hardCap: a.hardCap,
+      keepDays: AUDIT_KEEP_DAYS,
+      maintenanceIntervalSec: Math.round(MAINTENANCE_INTERVAL_MS / 1000)
+    }
   })
 })
 
 app.get('/api/admin/backups', (req, res) => {
   if (!requireAdmin(req, res)) return
   res.json({ items: listBackups(BACKUP_DIR), dir: BACKUP_DIR })
+})
+
+// Лёгкий endpoint для admin-UI: только конфигурация ретеншна + 2 числа из
+// audit-лога. Отдельно от /api/admin/db-stats, потому что тот делает
+// COUNT(*)+SUM(LENGTH(data)) по всем таблицам — для одной плашки на audit-page
+// это перебор.
+app.get('/api/admin/audit-retention', (req, res) => {
+  if (!requireAdmin(req, res)) return
+  const a = auditStats()
+  res.json({
+    rows: a.rows,
+    oldestAt: a.oldestAt,
+    hardCap: a.hardCap,
+    keepDays: AUDIT_KEEP_DAYS,
+    maintenanceIntervalSec: Math.round(MAINTENANCE_INTERVAL_MS / 1000)
+  })
 })
 
 // Восстановление БД из выбранного бэкапа. Concurrent-safe: второй параллельный

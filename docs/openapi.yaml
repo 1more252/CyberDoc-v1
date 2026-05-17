@@ -276,6 +276,28 @@ paths:
           $ref: '#/components/responses/AdminOnly'
         '503':
           $ref: '#/components/responses/Unavailable'
+  /api/admin/audit-retention:
+    get:
+      tags: [admin]
+      operationId: adminAuditRetention
+      summary: Конфигурация и состояние audit-ретеншна
+      description: |
+        Лёгкая альтернатива `/api/admin/db-stats` для UI: только данные о
+        audit-логе (текущий размер, оldest entry, хард-кап, конфиг ротации).
+        Без COUNT(*) по всем таблицам.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Состояние ретеншна
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditRetention'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '503':
+          $ref: '#/components/responses/Unavailable'
   /api/admin/restore:
     post:
       tags: [admin]
@@ -553,6 +575,27 @@ components:
               sizeBytes: { type: integer }
               mtime: { type: string, format: date-time }
         pendingWrites: { type: boolean }
+        auditRetention:
+          $ref: '#/components/schemas/AuditRetention'
+    AuditRetention:
+      type: object
+      description: Конфигурация и оперативное состояние audit-ротации
+      properties:
+        rows:
+          type: integer
+          description: Текущее число записей в audit-логе
+        oldestAt:
+          type: [integer, 'null']
+          description: ms timestamp самой старой записи (null если лог пуст)
+        hardCap:
+          type: integer
+          description: Хард-кап, при превышении старые записи отбрасываются
+        keepDays:
+          type: integer
+          description: AUDIT_KEEP_DAYS — записи старше отбрасываются в maintenance
+        maintenanceIntervalSec:
+          type: integer
+          description: Период фоновой maintenance-задачи
     BackupListEntry:
       type: object
       required: [name, sizeBytes, mtime]

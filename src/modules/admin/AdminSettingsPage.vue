@@ -2,6 +2,8 @@
 import { ref, onMounted, computed } from 'vue'
 import FlowNextStep from '@/ui/FlowNextStep.vue'
 import { adminApi } from './admin.api.js'
+import { formatDateTime } from '@/lib/format.js'
+import { auditFillStatus } from './audit-retention.js'
 
 const health = ref(null)
 const dbStats = ref(null)
@@ -65,6 +67,11 @@ const backupAge = computed(() => {
     severity: intervalsAgo > 1.5 ? 'danger' : intervalsAgo > 1 ? 'warning' : 'success'
   }
 })
+
+const auditFill = computed(() => auditFillStatus(
+  dbStats.value?.auditRetention?.rows,
+  dbStats.value?.auditRetention?.hardCap
+))
 
 onMounted(loadAll)
 </script>
@@ -261,6 +268,72 @@ onMounted(loadAll)
               <span v-else>Запустить maintenance</span>
             </button>
           </div>
+        </div>
+
+        <div
+          v-if="dbStats?.auditRetention"
+          class="cd-card p-3 mb-3"
+        >
+          <h2 class="h6 mb-2">
+            Журнал действий — ретеншн
+          </h2>
+          <dl class="row mb-2 small">
+            <dt class="col-6">
+              Записей сейчас
+            </dt>
+            <dd class="col-6">
+              {{ dbStats.auditRetention.rows.toLocaleString('ru-RU') }}
+              <span class="text-muted">/ {{ dbStats.auditRetention.hardCap.toLocaleString('ru-RU') }}</span>
+            </dd>
+            <dt class="col-6">
+              Хранение по возрасту
+            </dt>
+            <dd class="col-6">
+              <span v-if="dbStats.auditRetention.keepDays > 0">{{ dbStats.auditRetention.keepDays }} дней</span>
+              <span
+                v-else
+                class="text-muted"
+              >отключено</span>
+            </dd>
+            <dt class="col-6">
+              Самая старая запись
+            </dt>
+            <dd class="col-6">
+              <span v-if="dbStats.auditRetention.oldestAt">{{ formatDateTime(dbStats.auditRetention.oldestAt) }}</span>
+              <span
+                v-else
+                class="text-muted"
+              >—</span>
+            </dd>
+            <dt class="col-6">
+              Maintenance каждые
+            </dt>
+            <dd class="col-6">
+              {{ fmtDuration(dbStats.auditRetention.maintenanceIntervalSec) }}
+            </dd>
+          </dl>
+          <div
+            v-if="auditFill"
+            class="progress"
+            style="height: 6px"
+            :aria-label="`Заполнение хард-капа: ${auditFill.pct}%`"
+          >
+            <div
+              :class="['progress-bar', `bg-${auditFill.severity}`]"
+              role="progressbar"
+              :style="`width: ${auditFill.pct}%`"
+              :aria-valuenow="auditFill.pct"
+              aria-valuemin="0"
+              aria-valuemax="100"
+            />
+          </div>
+          <p
+            v-if="auditFill?.severity !== 'success'"
+            class="text-muted small mt-2 mb-0"
+          >
+            <i class="bi bi-exclamation-triangle me-1" />
+            При достижении 100% самые старые записи начнут отбрасываться без предупреждения. Запустите maintenance или снизьте интенсивность аудит-событий.
+          </p>
         </div>
 
         <div
